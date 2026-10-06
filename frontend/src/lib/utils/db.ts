@@ -11,13 +11,14 @@ import type { Device } from '$lib/types/device'
 import { DEVICE_TYPES } from '$lib/types/device'
 import type { Point } from '$lib/types/point'
 import type { Verdict } from '$lib/types/verdict'
-import { defaultBasis, judgePoint } from '$lib/types/verdict'
+import { defaultBasis } from '$lib/types/verdict'
 import type { Rectify } from '$lib/types/rectify'
 import { SUGGESTION_TEMPLATES } from '$lib/types/rectify'
 import { suggestLimitOhm } from '$lib/utils/resistance'
+import { assessPoint } from '$lib/utils/season'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gblightprot'
@@ -90,6 +91,75 @@ export class LightProtDatabase extends Dexie {
             })
         }
       })
+
+    // v3：测点新增季节系数，判定记录季节修正口径（估算值 + 系数），历史判定按新口径重算
+    this.version(DB_VERSION)
+      .stores({
+        buildings: 'id, name, usage, protectionClass, floors, heightM, updatedAt',
+        devices: 'id, buildingId, type, material, spec, quantity, installDate, updatedAt',
+        points: 'id, deviceId, code, measuredOhm, limitOhm, measureDate, updatedAt',
+        verdicts: 'id, pointId, result, confirmed, verdictDate, updatedAt',
+        rectifies: 'id, buildingId, pointId, state, deadline, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 历史测点没有现场系数，统一回落到月份表（measureDate 已在 v2 补齐）
+        await tx
+          .table('points')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (row.seasonFactor === undefined) row.seasonFactor = null
+          })
+
+        // 历史判定是按雨季实测值直接下的结论，必须按「最不利季节估算值」重算；
+        // 缺月份 / 系数的记录改挂「待判定」并提示补录。保留检测人署名与确认时间。
+        const points = await tx.table('points').toArray()
+        const devices = await tx.table('devices').toArray()
+        const buildings = await tx.table('buildings').toArray()
+        const pointById = new Map(points.map((point: Record<string, unknown>) => [point.id as string, point]))
+        const deviceById = new Map(devices.map((device: Record<string, unknown>) => [device.id as string, device]))
+        const buildingById = new Map(
+          buildings.map((building: Record<string, unknown>) => [building.id as string, building])
+        )
+
+        await tx
+          .table('verdicts')
+          .toCollection()
+          .modify((verdict: Record<string, unknown>) => {
+            const point = pointById.get(verdict.pointId as string) as
+              | {
+                  measuredOhm: number
+                  limitOhm: number
+                  measureDate: string
+                  seasonFactor?: number | null
+                  deviceId: string
+                }
+              | undefined
+            if (!point) {
+              verdict.result = '待判定'
+              verdict.estimatedOhm = null
+              verdict.seasonFactor = null
+              return
+            }
+            const assessment = assessPoint({
+              measuredOhm: point.measuredOhm,
+              limitOhm: point.limitOhm,
+              measureDate: point.measureDate,
+              seasonFactor: point.seasonFactor ?? null
+            })
+            verdict.result = assessment.result
+            verdict.estimatedOhm = assessment.estimatedOhm
+            verdict.seasonFactor = assessment.seasonFactor
+            const device = deviceById.get(point.deviceId) as { type?: string; buildingId?: string } | undefined
+            const building = buildingById.get(device?.buildingId ?? '') as
+              | { protectionClass?: string }
+              | undefined
+            verdict.basis = defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm, {
+              factor: assessment.seasonFactor,
+              source: assessment.factorSource,
+              month: assessment.month
+            })
+          })
+      })
   }
 }
 
@@ -129,6 +199,8 @@ interface SeedPoint {
   limitOhm: number
   meter: string
   measureDate: string
+  /** 现场实测季节系数；null 表示本次没量、按检测月份查表 */
+  seasonFactor: number | null
 }
 
 interface SeedDevice {
@@ -148,7 +220,6 @@ interface SeedDevice {
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now()
-  const today = new Date(now).toISOString().slice(0, 10)
 
   const buildings: Array<Omit<Building, 'createdAt' | 'updatedAt'>> = [
     {
@@ -198,7 +269,8 @@ export async function seedDemoData(): Promise<void> {
           measuredOhm: 3.2,
           limitOhm: 10,
           meter: 'ZC-8 接地电阻测试仪 / No.20230517',
-          measureDate: today
+          measureDate: '2026-07-15',
+          seasonFactor: null
         },
         {
           id: 'pnt_oil_belt_2',
@@ -208,7 +280,8 @@ export async function seedDemoData(): Promise<void> {
           measuredOhm: 4.1,
           limitOhm: 10,
           meter: 'ZC-8 接地电阻测试仪 / No.20230517',
-          measureDate: today
+          measureDate: '2026-07-15',
+          seasonFactor: null
         }
       ]
     },
@@ -229,17 +302,19 @@ export async function seedDemoData(): Promise<void> {
           measuredOhm: 12.6,
           limitOhm: 10,
           meter: 'ZC-8 接地电阻测试仪 / No.20230517',
-          measureDate: today
+          measureDate: '2026-01-16',
+          seasonFactor: null
         },
         {
           id: 'pnt_oil_down_2',
           deviceId: 'dev_oil_down',
           code: 'JD-OIL-04',
           location: '南侧 6 号引下线断接卡处',
-          measuredOhm: 6.8,
+          measuredOhm: 8.6,
           limitOhm: 10,
           meter: 'ZC-8 接地电阻测试仪 / No.20230517',
-          measureDate: today
+          measureDate: '2026-06-18',
+          seasonFactor: null
         }
       ]
     },
@@ -260,7 +335,8 @@ export async function seedDemoData(): Promise<void> {
           measuredOhm: 3.9,
           limitOhm: 4,
           meter: 'ZC-8 接地电阻测试仪 / No.20230517',
-          measureDate: today
+          measureDate: '2026-06-20',
+          seasonFactor: null
         },
         {
           id: 'pnt_oil_grid_2',
@@ -270,7 +346,8 @@ export async function seedDemoData(): Promise<void> {
           measuredOhm: 5.4,
           limitOhm: 4,
           meter: 'ZC-8 接地电阻测试仪 / No.20230517',
-          measureDate: today
+          measureDate: '2026-06-20',
+          seasonFactor: null
         }
       ]
     },
@@ -291,7 +368,9 @@ export async function seedDemoData(): Promise<void> {
           measuredOhm: 7.4,
           limitOhm: 10,
           meter: 'DER2571 数字接地电阻表 / No.A221104',
-          measureDate: today
+          measureDate: '2026-08-12',
+          // 现场四极法实测量 ψ=1.5：以现场为准，估算 11.1 Ω 超限（月份表仅 1.05）
+          seasonFactor: 1.5
         }
       ]
     },
@@ -312,7 +391,8 @@ export async function seedDemoData(): Promise<void> {
           measuredOhm: 8.9,
           limitOhm: 10,
           meter: 'DER2571 数字接地电阻表 / No.A221104',
-          measureDate: today
+          measureDate: '2026-12-09',
+          seasonFactor: null
         },
         {
           id: 'pnt_hosp_down_2',
@@ -322,7 +402,8 @@ export async function seedDemoData(): Promise<void> {
           measuredOhm: 15.2,
           limitOhm: 10,
           meter: 'DER2571 数字接地电阻表 / No.A221104',
-          measureDate: today
+          measureDate: '2026-12-09',
+          seasonFactor: null
         }
       ]
     },
@@ -343,7 +424,9 @@ export async function seedDemoData(): Promise<void> {
           measuredOhm: 9.4,
           limitOhm: 10,
           meter: 'ZC-8 接地电阻测试仪 / No.20201122',
-          measureDate: today
+          // 手记漏填检测月份、现场也没量系数：不给合格结论，挂「待判定」提示补录
+          measureDate: '',
+          seasonFactor: null
         }
       ]
     }
@@ -372,20 +455,28 @@ export async function seedDemoData(): Promise<void> {
       await db.devices.bulkPut(allDevices)
       await db.points.bulkPut(allPoints)
 
-      // 逐点自动初判：实测值 ≤ 限值判合格，否则不合格，检测人确认后生效
+      // 逐点自动初判：实测 × 季节系数 ψ 折算最不利季节估算值后再与限值比对；
+      // 缺检测月份 / 系数的记录挂「待判定」。检测人确认后生效。
       const buildingOfDevice = new Map(allDevices.map((device) => [device.id, device.buildingId]))
       const deviceOfPoint = new Map(allDevices.map((device) => [device.id, device]))
       const verdicts: Verdict[] = allPoints.map((point, index) => {
         const device = deviceOfPoint.get(point.deviceId)
         const building = buildings.find((item) => item.id === buildingOfDevice.get(point.deviceId))
+        const assessment = assessPoint(point)
         return {
           id: `vrd_${point.id}`,
           pointId: point.id,
-          result: judgePoint(point.measuredOhm, point.limitOhm),
-          basis: defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm),
+          result: assessment.result,
+          basis: defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm, {
+            factor: assessment.seasonFactor,
+            source: assessment.factorSource,
+            month: assessment.month
+          }),
           inspector: '陈立群',
           verdictDate: point.measureDate,
           confirmed: true,
+          estimatedOhm: assessment.estimatedOhm,
+          seasonFactor: assessment.seasonFactor,
           ...stamp(1000 + index)
         }
       })
@@ -402,11 +493,15 @@ export async function seedDemoData(): Promise<void> {
               ? SUGGESTION_TEMPLATES[0]
               : SUGGESTION_TEMPLATES[1]
           const deadline = new Date(now + template.days * 86400000).toISOString().slice(0, 10)
+          const estimateText =
+            point && verdict.estimatedOhm !== null
+              ? `${point.code} 原始实测 ${point.measuredOhm} Ω，季节修正估算 ${verdict.estimatedOhm} Ω，限值 ${point.limitOhm} Ω`
+              : '测点数据缺失'
           return {
             id: `rct_${verdict.id}`,
             buildingId,
             pointId: verdict.pointId,
-            problem: `${template.problem}：${point ? `${point.code} 实测 ${point.measuredOhm} Ω，限值 ${point.limitOhm} Ω` : '测点数据缺失'}`,
+            problem: `${template.problem}：${estimateText}`,
             suggestion: template.suggestion,
             deadline,
             state: index === 0 ? '待整改' : '已整改',

@@ -10,7 +10,8 @@ import { db, watchTable } from '$lib/utils/db'
 import type { Point, PointDraft } from '$lib/types/point'
 import { createEmptyPointDraft } from '$lib/types/point'
 import { deviceList } from '$lib/stores/buildingStore'
-import { isQualified, limitRatio } from '$lib/utils/resistance'
+import { limitRatio } from '$lib/utils/resistance'
+import { assessPoint } from '$lib/utils/season'
 
 /** 响应式测点集合 */
 export const pointList = writable<Point[]>([])
@@ -43,17 +44,21 @@ export const activePoints = derived([pointList, activeDeviceId], ([$points, $dev
     .sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
 })
 
-/** 测点行：附带装置类型与合格标记，供测点录入页表格展示 */
+/** 测点行：附带装置、季节修正评估与合格标记，供测点录入页表格展示 */
 export const pointRows = derived([pointList, deviceList], ([$points, $devices]) =>
   $points
     .map((point) => {
       const device = $devices.find((item) => item.id === point.deviceId)
+      const assessment = assessPoint(point)
       return {
         point,
         device,
         deviceType: device?.type ?? '未知装置',
-        qualified: isQualified(point.measuredOhm, point.limitOhm),
-        ratio: limitRatio(point.measuredOhm, point.limitOhm)
+        assessment,
+        /** 判定一律以最不利季节估算值为准；待判定时 qualified=false */
+        qualified: assessment.result === '合格',
+        pending: assessment.result === '待判定',
+        ratio: assessment.estimatedOhm !== null ? limitRatio(assessment.estimatedOhm, point.limitOhm) : 0
       }
     })
     .sort((a, b) => b.ratio - a.ratio)
@@ -114,7 +119,7 @@ export async function bulkSetMeasured(deviceId: string, measuredOhm: number): Pr
 export async function importPointRows(
   deviceId: string,
   rows: Array<{ code: string; location: string; measuredOhm: number; limitOhm: number }>,
-  meta: { meter: string; measureDate: string }
+  meta: { meter: string; measureDate: string; seasonFactor?: number | null }
 ): Promise<number> {
   const now = Date.now()
   const records: Point[] = rows.map((row, index) => ({
@@ -124,6 +129,8 @@ export async function importPointRows(
     location: row.location,
     measuredOhm: row.measuredOhm,
     limitOhm: row.limitOhm,
+    // 批量粘贴未逐点记录现场系数：统一取本次导入填入的系数，留空则按月份表折算
+    seasonFactor: meta.seasonFactor ?? null,
     meter: meta.meter,
     measureDate: meta.measureDate,
     createdAt: now + index,

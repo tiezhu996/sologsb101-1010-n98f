@@ -23,6 +23,7 @@
   } from '$lib/stores/buildingStore.ts'
   import { pointStatsByDevice } from '$lib/stores/pointStats.ts'
   import { pointsOfDevice } from '$lib/stores/pointStore.ts'
+  import { assessPoint, factorLabel } from '$lib/utils/season.ts'
   import { DEVICE_MATERIALS, DEVICE_TYPES } from '$lib/types/device.ts'
   import type { Device, DeviceType } from '$lib/types/device.ts'
   import { suggestLimitOhm } from '$lib/utils/resistance.ts'
@@ -71,7 +72,7 @@
     $filteredDevices
       .map((device) => {
         const building = buildingById(device.buildingId)
-        const stats = $pointStatsByDevice[device.id] ?? { count: 0, unqualified: 0, minOhm: 0, maxOhm: 0 }
+        const stats = $pointStatsByDevice[device.id] ?? { count: 0, unqualified: 0, pending: 0, minOhm: 0, maxOhm: 0 }
         return { device, building, stats, expanded: expandedDeviceId === device.id }
       })
       .filter((row) => !$deviceFilter.onlyWithoutPoint || row.stats.count === 0)
@@ -82,7 +83,8 @@
     devices: rows.length,
     quantity: rows.reduce((sum, row) => sum + row.device.quantity, 0),
     points: rows.reduce((sum, row) => sum + row.stats.count, 0),
-    unqualified: rows.reduce((sum, row) => sum + row.stats.unqualified, 0)
+    unqualified: rows.reduce((sum, row) => sum + row.stats.unqualified, 0),
+    pending: rows.reduce((sum, row) => sum + row.stats.pending, 0)
   })
 
   function openCreate(): void {
@@ -219,10 +221,16 @@
     <StatBadge label="数量合计" value={totals.quantity} suffix="根/处" tone="info" />
     <StatBadge label="关联测点" value={totals.points} suffix="点" tone="default" />
     <StatBadge
-      label="不合格测点"
+      label="估算不合格测点"
       value={totals.unqualified}
       suffix="点"
       tone={totals.unqualified > 0 ? 'danger' : 'success'}
+    />
+    <StatBadge
+      label="待判定测点"
+      value={totals.pending}
+      suffix="点"
+      tone={totals.pending > 0 ? 'warning' : 'success'}
     />
   </div>
 
@@ -272,9 +280,14 @@
                 {#if row.stats.count === 0}
                   <span class="gb-hint">未录入测点</span>
                 {:else if row.stats.unqualified > 0}
-                  <span class="gb-danger">{row.stats.unqualified} 点不合格</span>
+                  <span class="gb-danger">{row.stats.unqualified} 点估算不合格</span>
+                  {#if row.stats.pending > 0}
+                    <span class="gb-warning"> · {row.stats.pending} 点待判定</span>
+                  {/if}
+                {:else if row.stats.pending > 0}
+                  <span class="gb-warning">{row.stats.pending} 点待判定（缺月份/系数）</span>
                 {:else}
-                  <span class="ok-text">全部合格</span>
+                  <span class="ok-text">季节修正后全部合格</span>
                 {/if}
               </td>
               <td class="row-actions">
@@ -305,7 +318,9 @@
                           <tr>
                             <th>测点编号</th>
                             <th>位置</th>
-                            <th class="is-num">实测（Ω）</th>
+                            <th class="is-num">原始实测（Ω）</th>
+                            <th class="is-num">ψ</th>
+                            <th class="is-num">最不利估算（Ω）</th>
                             <th class="is-num">限值（Ω）</th>
                             <th>判定</th>
                             <th>检测仪器</th>
@@ -313,12 +328,25 @@
                         </thead>
                         <tbody>
                           {#each pointsOfDevice(row.device.id) as point (point.id)}
-                            <tr>
+                            {@const pa = assessPoint(point)}
+                            <tr class:is-pending={pa.result === '待判定'}>
                               <td class="gb-mono">{point.code}</td>
                               <td>{point.location}</td>
                               <td class="is-num gb-mono">{point.measuredOhm}</td>
+                              <td class="is-num gb-mono">{pa.seasonFactor ?? '缺失'}</td>
+                              <td class="is-num gb-mono">{pa.estimatedOhm ?? '—'}</td>
                               <td class="is-num gb-mono">{point.limitOhm}</td>
-                              <td><QualifyTag measuredOhm={point.measuredOhm} limitOhm={point.limitOhm} size="small" /></td>
+                              <td>
+                                <QualifyTag
+                                  result={pa.result}
+                                  measuredOhm={point.measuredOhm}
+                                  estimatedOhm={pa.estimatedOhm}
+                                  limitOhm={point.limitOhm}
+                                  pendingReason={pa.pendingReason}
+                                  factorText={factorLabel(pa)}
+                                  size="small"
+                                />
+                              </td>
                               <td class="gb-hint">{point.meter}</td>
                             </tr>
                           {/each}
@@ -451,6 +479,10 @@
 
   .expand-row td {
     background: #f9fbfd;
+  }
+
+  tr.is-pending td {
+    background: #fffaf0;
   }
 
   .expand {

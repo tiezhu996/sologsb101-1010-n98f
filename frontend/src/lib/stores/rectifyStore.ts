@@ -11,7 +11,9 @@ import type { Rectify, RectifyFilterState, RectifyState } from '$lib/types/recti
 import { RECTIFY_STATES, RECTIFY_TRANSITIONS, SUGGESTION_TEMPLATES, createEmptyRectifyFilter } from '$lib/types/rectify'
 import { buildingList, deviceList } from '$lib/stores/buildingStore'
 import { pointList } from '$lib/stores/pointStore'
-import { isQualified, qualifyRate } from '$lib/utils/resistance'
+import { qualifyRate } from '$lib/utils/resistance'
+import { assessPoint } from '$lib/utils/season'
+import type { PointAssessment } from '$lib/utils/season'
 
 /** 响应式判定集合 */
 export const verdictList = writable<Verdict[]>([])
@@ -36,57 +38,79 @@ export const verdictRows = derived(
       const device = $devices.find((item) => item.id === point.deviceId)
       const building = device ? $buildings.find((item) => item.id === device.buildingId) : undefined
       const verdict = $verdicts.find((item) => item.pointId === point.id) ?? null
-      const auto = judgePoint(point.measuredOhm, point.limitOhm)
+      const assessment: PointAssessment = assessPoint(point)
       return {
         point,
         device,
         building,
         verdict,
-        autoResult: auto,
+        assessment,
+        autoResult: assessment.result,
         /** 初判与检测人结论是否一致 */
-        consistent: verdict === null ? false : verdict.result === auto,
-        qualified: verdict ? verdict.result === '合格' : auto === '合格'
+        consistent: verdict === null ? false : verdict.result === assessment.result,
+        /** 检测人已下结论以结论为准，否则以估算值自动初判为准；待判定不算合格 */
+        qualified: verdict
+          ? verdict.result === '合格'
+          : assessment.result === '合格',
+        pending: verdict ? verdict.result === '待判定' : assessment.result === '待判定'
       }
     })
 )
 
-/** 合格率派生值：全部测点、按建筑物、按装置 */
+/**
+ * 某测点当前生效的判定结果（合格 / 不合格 / 待判定）。
+ * 已存在非待判定的人工 / 自动判定记录时以记录为准；否则按季节修正估算值现算。
+ */
+export function effectiveResult(
+  pointId: string,
+  assessment: PointAssessment,
+  verdicts: Verdict[] = get(verdictList)
+): VerdictResult {
+  const verdict = verdicts.find((item) => item.pointId === pointId)
+  if (verdict && verdict.result !== '待判定') return verdict.result
+  return assessment.result
+}
+
+/** 合格率派生值：全部测点、按建筑物、按装置（合格口径均为季节修正估算值） */
 export const qualifyStats = derived([pointList, verdictList, deviceList, buildingList], ([$points, $verdicts, $devices, $buildings]) => {
-  const qualifiedOf = (pointId: string, measuredOhm: number, limitOhm: number): boolean => {
-    const verdict = $verdicts.find((item) => item.pointId === pointId)
-    if (verdict && verdict.result !== '待判定') return verdict.result === '合格'
-    return isQualified(measuredOhm, limitOhm)
+  const resultOf = (point: (typeof $points)[number]): VerdictResult => {
+    const verdict = $verdicts.find((item) => item.pointId === point.id)
+    if (verdict && verdict.result !== '待判定') return verdict.result
+    return assessPoint(point).result
   }
-  const flags = $points.map((point) => qualifiedOf(point.id, point.measuredOhm, point.limitOhm))
+  const results = $points.map(resultOf)
   const overall = {
-    total: flags.length,
-    passed: flags.filter(Boolean).length,
-    failed: flags.filter((flag) => !flag).length,
-    rate: qualifyRate(flags)
+    total: results.length,
+    passed: results.filter((result) => result === '合格').length,
+    failed: results.filter((result) => result === '不合格').length,
+    pending: results.filter((result) => result === '待判定').length,
+    rate: qualifyRate(results.map((result) => result === '合格'))
   }
 
   const byBuilding = $buildings.map((building) => {
     const deviceIds = new Set($devices.filter((device) => device.buildingId === building.id).map((device) => device.id))
     const points = $points.filter((point) => deviceIds.has(point.deviceId))
-    const buildingFlags = points.map((point) => qualifiedOf(point.id, point.measuredOhm, point.limitOhm))
+    const buildingResults = points.map(resultOf)
     return {
       buildingId: building.id,
       buildingName: building.name,
-      total: buildingFlags.length,
-      failed: buildingFlags.filter((flag) => !flag).length,
-      rate: qualifyRate(buildingFlags)
+      total: buildingResults.length,
+      failed: buildingResults.filter((result) => result === '不合格').length,
+      pending: buildingResults.filter((result) => result === '待判定').length,
+      rate: qualifyRate(buildingResults.map((result) => result === '合格'))
     }
   })
 
   const byDevice = $devices.map((device) => {
     const points = $points.filter((point) => point.deviceId === device.id)
-    const deviceFlags = points.map((point) => qualifiedOf(point.id, point.measuredOhm, point.limitOhm))
+    const deviceResults = points.map(resultOf)
     return {
       deviceId: device.id,
       deviceType: device.type,
-      total: deviceFlags.length,
-      failed: deviceFlags.filter((flag) => !flag).length,
-      rate: qualifyRate(deviceFlags)
+      total: deviceResults.length,
+      failed: deviceResults.filter((result) => result === '不合格').length,
+      pending: deviceResults.filter((result) => result === '待判定').length,
+      rate: qualifyRate(deviceResults.map((result) => result === '合格'))
     }
   })
 
@@ -156,17 +180,26 @@ export async function autoJudgePoint(pointId: string, inspector = ''): Promise<V
   if (!point) return null
   const device = get(deviceList).find((item) => item.id === point.deviceId)
   const building = device ? get(buildingList).find((item) => item.id === device.buildingId) : undefined
-  const result = judgePoint(point.measuredOhm, point.limitOhm)
+  const assessment = assessPoint(point)
+  const result = judgePoint(assessment.estimatedOhm, point.limitOhm)
   const existing = get(verdictList).find((item) => item.pointId === pointId)
   const now = Date.now()
   const row: Verdict = {
     id: existing?.id ?? `vrd_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
     pointId,
     result,
-    basis: existing?.basis || defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm),
+    basis:
+      existing?.basis ||
+      defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm, {
+        factor: assessment.seasonFactor,
+        source: assessment.factorSource,
+        month: assessment.month
+      }),
     inspector: inspector || existing?.inspector || '',
     verdictDate: point.measureDate,
     confirmed: false,
+    estimatedOhm: assessment.estimatedOhm,
+    seasonFactor: assessment.seasonFactor,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now
   }
@@ -197,14 +230,24 @@ export async function bulkSetVerdictResult(pointIds: string[], result: VerdictRe
     const device = get(deviceList).find((item) => item.id === point.deviceId)
     const building = device ? get(buildingList).find((item) => item.id === device.buildingId) : undefined
     const existing = get(verdictList).find((item) => item.pointId === pointId)
+    const assessment = assessPoint(point)
+    // 批量改判是检测人人工结论：仍按季节修正口径留存估算值与系数，便于报告追溯
     const row: Verdict = {
       id: existing?.id ?? `vrd_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
       pointId,
       result,
-      basis: existing?.basis || defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm),
+      basis:
+        existing?.basis ||
+        defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm, {
+          factor: assessment.seasonFactor,
+          source: assessment.factorSource,
+          month: assessment.month
+        }),
       inspector,
       verdictDate: existing?.verdictDate ?? point.measureDate,
       confirmed: true,
+      estimatedOhm: assessment.estimatedOhm,
+      seasonFactor: assessment.seasonFactor,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now
     }
@@ -240,7 +283,7 @@ export async function generateRectifies(options: {
       id: `rct_${now.toString(36)}${index}${Math.random().toString(36).slice(2, 6)}`,
       buildingId: row.building?.id ?? row.device?.buildingId ?? '',
       pointId: row.point.id,
-      problem: `${template.problem}：${row.point.code} 实测 ${row.point.measuredOhm} Ω，限值 ${row.point.limitOhm} Ω`,
+      problem: `${template.problem}：${row.point.code} 原始实测 ${row.point.measuredOhm} Ω，季节修正估算 ${row.assessment.estimatedOhm ?? '—'} Ω，限值 ${row.point.limitOhm} Ω`,
       suggestion: template.suggestion,
       deadline,
       state: '待整改',

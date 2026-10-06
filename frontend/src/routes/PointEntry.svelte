@@ -26,7 +26,8 @@
   import type { Point, PointPasteRow } from '$lib/types/point.ts'
   import { DEVICE_TYPES } from '$lib/types/device.ts'
   import type { DeviceType } from '$lib/types/device.ts'
-  import { isQualified, limitRatio, qualifyRate, suggestLimitOhm } from '$lib/utils/resistance.ts'
+  import { qualifyRate, suggestLimitOhm } from '$lib/utils/resistance.ts'
+  import { assessPoint, factorLabel, SEASON_FACTOR_BY_MONTH } from '$lib/utils/season.ts'
   import { readQuery, writeQuery } from '$lib/utils/query.ts'
   import { useRouter } from '$lib/utils/router.ts'
 
@@ -37,6 +38,8 @@
     location: string
     measuredOhm: number
     limitOhm: number
+    /** 现场实测季节系数；null 表示没量、按检测月份查表 */
+    seasonFactor: number | null
     meter: string
     measureDate: string
   }
@@ -57,15 +60,38 @@
   let pasteErrors = $state<string[]>([])
   let pastePreview = $state<PointPasteRow[]>([])
   let bulkValue = $state<number | null>(null)
+  /** 批量粘贴导入的检测日期与现场系数（整批共用；留空回落到月份表） */
+  let pasteMeasureDate = $state(new Date().toISOString().slice(0, 10))
+  let pasteSeasonFactor = $state<number | null>(null)
 
   let form = $state<PointForm>({
     code: '',
     location: '',
     measuredOhm: 0,
     limitOhm: 10,
+    seasonFactor: null,
     meter: '',
     measureDate: new Date().toISOString().slice(0, 10)
   })
+
+  /** 表单当前的季节修正预估（用于在录入时即时提示折算结果） */
+  const formAssessment = $derived(
+    assessPoint({
+      measuredOhm: Number(form.measuredOhm),
+      limitOhm: Number(form.limitOhm),
+      measureDate: form.measureDate,
+      seasonFactor: form.seasonFactor
+    })
+  )
+
+  /** 批量粘贴预览的统一修正口径（限值取每行第 4 列，缺省取装置建议限值） */
+  const pasteAssessmentOf = (measuredOhm: number, limitOhm: number) =>
+    assessPoint({
+      measuredOhm,
+      limitOhm,
+      measureDate: pasteMeasureDate,
+      seasonFactor: pasteSeasonFactor
+    })
 
   const deviceOptions = $derived(
     $deviceList.map((device) => {
@@ -96,7 +122,8 @@
 
   const totals = $derived({
     points: rows.length,
-    unqualified: rows.filter((row) => !row.qualified).length,
+    unqualified: rows.filter((row) => !row.qualified && !row.pending).length,
+    pending: rows.filter((row) => row.pending).length,
     rate: qualifyRate(rows.map((row) => row.qualified)),
     activeDevicePoints: $activeDeviceId ? pointsOfDevice($activeDeviceId).length : $pointList.length
   })
@@ -123,6 +150,7 @@
       location: '',
       measuredOhm: 0,
       limitOhm: defaultLimit,
+      seasonFactor: existing[0]?.seasonFactor ?? null,
       meter: existing[0]?.meter ?? '',
       measureDate: existing[0]?.measureDate ?? new Date().toISOString().slice(0, 10)
     }
@@ -137,6 +165,7 @@
       location: point.location,
       measuredOhm: point.measuredOhm,
       limitOhm: point.limitOhm,
+      seasonFactor: point.seasonFactor ?? null,
       meter: point.meter,
       measureDate: point.measureDate
     }
@@ -156,11 +185,21 @@
       formError = '限值应为大于 0 的数字（Ω）'
       return
     }
+    if (form.seasonFactor !== null && (!Number.isFinite(Number(form.seasonFactor)) || Number(form.seasonFactor) <= 0)) {
+      formError = '现场季节系数应为大于 0 的数字；本次没量请留空，系统按检测月份查表'
+      return
+    }
+    // 检测日期与现场系数至少要有一个能确定季节系数，否则该测点只能挂待判定
+    if (!form.measureDate && form.seasonFactor === null) {
+      formError = '检测月份与现场季节系数不能同时为空：请填写检测日期或现场实测系数，否则该测点只能待判定'
+      return
+    }
     const payload = {
       code: form.code.trim(),
       location: form.location.trim(),
       measuredOhm: Number(form.measuredOhm),
       limitOhm: Number(form.limitOhm),
+      seasonFactor: form.seasonFactor,
       meter: form.meter.trim(),
       measureDate: form.measureDate
     }
@@ -192,6 +231,8 @@
     pasteText.set('')
     pasteErrors = []
     pastePreview = []
+    pasteMeasureDate = new Date().toISOString().slice(0, 10)
+    pasteSeasonFactor = null
     showPaste = true
   }
 
@@ -207,13 +248,22 @@
     pasteErrors = parsed.errors
     pastePreview = parsed.rows
     if (parsed.rows.length === 0) return
+    if (!pasteMeasureDate && pasteSeasonFactor === null) {
+      pasteErrors = ['检测月份与现场季节系数不能同时为空，否则整批测点只能待判定']
+      return
+    }
+    if (pasteSeasonFactor !== null && (!Number.isFinite(Number(pasteSeasonFactor)) || Number(pasteSeasonFactor) <= 0)) {
+      pasteErrors = ['现场季节系数应为大于 0 的数字；没量请留空']
+      return
+    }
     const ok = window.confirm(
       `将用 ${parsed.rows.length} 行数据替换该装置现有 ${pointsOfDevice($activeDeviceId).length} 个测点，确认导入？`
     )
     if (!ok) return
     await importPointRows($activeDeviceId, parsed.rows, {
       meter: pointsOfDevice($activeDeviceId)[0]?.meter ?? '未填写',
-      measureDate: new Date().toISOString().slice(0, 10)
+      measureDate: pasteMeasureDate,
+      seasonFactor: pasteSeasonFactor
     })
     showPaste = false
   }
@@ -249,7 +299,8 @@
     <div>
       <h2 class="page__title">接地电阻测点录入</h2>
       <p class="gb-hint">
-        按装置逐点录入实测电阻与限值，可批量粘贴整段手记数据；实测值 ≤ 限值判合格，超限会即时标红。
+        按装置逐点录入实测电阻与限值。雨季实测值偏小不能直接判合格：系统按检测月份查季节系数折算成旱季（最不利季节）估算值，
+        <b>判定与合格率一律以估算值为准</b>，原始实测值另存在报告里；现场当次量了季节系数就以现场为准。缺月份或系数的测点标「待判定」并提示补录。
       </p>
       {#if activeDevice}
         <p class="gb-hint">
@@ -279,10 +330,16 @@
   <div class="gb-stats-row">
     <StatBadge label="当前测点" value={totals.points} suffix="点" tone="primary" />
     <StatBadge
-      label="不合格"
+      label="估算超限"
       value={totals.unqualified}
       suffix="点"
       tone={totals.unqualified > 0 ? 'danger' : 'success'}
+    />
+    <StatBadge
+      label="待判定"
+      value={totals.pending}
+      suffix="点"
+      tone={totals.pending > 0 ? 'warning' : 'success'}
     />
     <StatBadge label="合格率" value={totals.rate} percent={totals.rate} tone="success" />
     <StatBadge label="选中装置测点" value={totals.activeDevicePoints} suffix="点" tone="info" />
@@ -322,9 +379,11 @@
             <th>测点编号</th>
             <th>位置</th>
             <th>所属装置</th>
-            <th class="is-num">实测（Ω）</th>
+            <th class="is-num">原始实测（Ω）</th>
+            <th class="is-num">季节系数 ψ</th>
+            <th class="is-num">最不利估算（Ω）</th>
             <th class="is-num">限值（Ω）</th>
-            <th class="is-num">占限值</th>
+            <th class="is-num">估算占限值</th>
             <th>判定</th>
             <th>检测仪器</th>
             <th>检测日期</th>
@@ -333,7 +392,7 @@
         </thead>
         <tbody>
           {#each rows as row (row.point.id)}
-            <tr class:is-bad={!row.qualified}>
+            <tr class:is-bad={!row.qualified && !row.pending} class:is-pending={row.pending}>
               <td class="gb-mono">{row.point.code}</td>
               <td>{row.point.location}</td>
               <td>
@@ -341,18 +400,46 @@
                 <span class="gb-hint"> {buildingById(row.device?.buildingId)?.name ?? ''}</span>
               </td>
               <td class="is-num gb-mono">{row.point.measuredOhm}</td>
+              <td class="is-num gb-mono">
+                {#if row.assessment.seasonFactor !== null}
+                  {row.assessment.seasonFactor}
+                  <div class="gb-hint">{row.assessment.factorSource === '现场实测量' ? '现场' : `${row.assessment.month ?? '?'}月表`}</div>
+                {:else}
+                  <span class="gb-warning">缺失</span>
+                {/if}
+              </td>
+              <td class="is-num gb-mono">{row.assessment.estimatedOhm ?? '—'}</td>
               <td class="is-num gb-mono">{row.point.limitOhm}</td>
-              <td class="is-num gb-mono">{limitRatio(row.point.measuredOhm, row.point.limitOhm)}</td>
+              <td class="is-num gb-mono">{row.assessment.estimatedOhm !== null ? row.ratio : '—'}</td>
               <td>
-                <QualifyTag measuredOhm={row.point.measuredOhm} limitOhm={row.point.limitOhm} size="small" />
-                {#if !isQualified(row.point.measuredOhm, row.point.limitOhm)}
+                <QualifyTag
+                  result={row.assessment.result}
+                  measuredOhm={row.point.measuredOhm}
+                  estimatedOhm={row.assessment.estimatedOhm}
+                  limitOhm={row.point.limitOhm}
+                  pendingReason={row.assessment.pendingReason}
+                  factorText={factorLabel(row.assessment)}
+                  size="small"
+                />
+                {#if row.assessment.pendingReason}
+                  <span class="gb-warning" title={row.assessment.pendingReason}>待补录</span>
+                {:else if !row.qualified}
                   <span class="gb-danger">
-                    超限 {((limitRatio(row.point.measuredOhm, row.point.limitOhm) - 1) * 100).toFixed(1)}%
+                    估算超限 {((row.ratio - 1) * 100).toFixed(1)}%
                   </span>
+                  {#if row.point.measuredOhm <= row.point.limitOhm}
+                    <div class="gb-warning">雨季实测合格，旱季复测超限</div>
+                  {/if}
                 {/if}
               </td>
               <td class="gb-hint">{row.point.meter}</td>
-              <td class="gb-mono">{row.point.measureDate}</td>
+              <td class="gb-mono">
+                {#if row.point.measureDate}
+                  {row.point.measureDate}
+                {:else}
+                  <span class="gb-warning">缺月份</span>
+                {/if}
+              </td>
               <td class="row-actions">
                 <button class="btn btn--small" type="button" onclick={() => openEdit(row.point)}>编辑</button>
                 <button class="btn btn--danger btn--small" type="button" onclick={() => confirmRemove(row.point)}>
@@ -408,13 +495,53 @@
             <input type="number" min="0.01" max="1000" step="0.01" bind:value={form.limitOhm} />
           </label>
           <label class="gb-field">
+            <span>现场实测季节系数 ψ（没量留空，按月份查表）</span>
+            <input
+              type="number"
+              min="0.01"
+              max="10"
+              step="0.01"
+              bind:value={form.seasonFactor}
+              placeholder="留空 = 按检测月份查表"
+            />
+          </label>
+          <label class="gb-field">
             <span>检测仪器</span>
             <input bind:value={form.meter} placeholder="如 ZC-8 接地电阻测试仪 / No.20230517" maxlength="60" />
           </label>
           <label class="gb-field">
-            <span>检测日期</span>
+            <span>检测日期（决定月份系数）</span>
             <input type="date" bind:value={form.measureDate} />
           </label>
+        </div>
+
+        <div class="season-preview">
+          {#if formAssessment.pendingReason}
+            <p class="gb-alert">⚠ {formAssessment.pendingReason}</p>
+          {:else if formAssessment.seasonFactor !== null && formAssessment.estimatedOhm !== null}
+            <p class="gb-hint">
+              {factorLabel(formAssessment)}（来源：{formAssessment.factorSource}）→ 原始实测 {form.measuredOhm || 0} Ω ×
+              ψ = <b>最不利估算 {formAssessment.estimatedOhm} Ω</b>，限值 {form.limitOhm} Ω，判定
+              <b class:gb-ok={formAssessment.result === '合格'} class:gb-danger={formAssessment.result === '不合格'}>
+                {formAssessment.result}
+              </b>
+            </p>
+          {/if}
+          <details class="gb-hint">
+            <summary>查看月份季节系数表</summary>
+            <table class="month-table">
+              <tbody>
+                <tr>
+                  {#each SEASON_FACTOR_BY_MONTH as factor, monthIndex (monthIndex)}
+                    <td>
+                      <b>{monthIndex + 1} 月</b>
+                      <br />ψ={factor}
+                    </td>
+                  {/each}
+                </tr>
+              </tbody>
+            </table>
+          </details>
         </div>
       </div>
       <div class="gb-modal__foot">
@@ -443,10 +570,20 @@
       </div>
       <div class="gb-modal__body">
         <p class="gb-hint">
-          每行一条，格式「测点编号,位置,实测电阻[,限值]」，逗号 / 制表符 / 分号均可。示例：<br />
+          每行一条，格式「测点编号,位置,实测电阻[,限值]」，逗号 / 制表符 / 分号均可。整批共用下方检测月份与现场系数。示例：<br />
           <span class="gb-mono">JD-07,罐区东侧测试井,3.8,4</span><br />
           <span class="gb-mono">JD-08;罐区西侧测试井;5.6;4</span>
         </p>
+        <div class="bulk-row">
+          <label class="gb-field">
+            <span>检测日期（月份系数）</span>
+            <input type="date" bind:value={pasteMeasureDate} />
+          </label>
+          <label class="gb-field">
+            <span>现场实测季节系数 ψ（没量留空）</span>
+            <input type="number" min="0.01" max="10" step="0.01" bind:value={pasteSeasonFactor} placeholder="留空 = 按月份查表" />
+          </label>
+        </div>
         <label class="gb-field">
           <span>粘贴内容</span>
           <textarea
@@ -466,15 +603,36 @@
         {#if pastePreview.length > 0}
           <table class="gb-table">
             <thead>
-              <tr><th>编号</th><th>位置</th><th class="is-num">实测</th><th class="is-num">限值</th></tr>
+              <tr>
+                <th>编号</th>
+                <th>位置</th>
+                <th class="is-num">原始实测</th>
+                <th class="is-num">限值</th>
+                <th class="is-num">系数 ψ</th>
+                <th class="is-num">最不利估算</th>
+                <th>判定</th>
+              </tr>
             </thead>
             <tbody>
               {#each pastePreview as row, index (index)}
-                <tr>
+                {@const pa = pasteAssessmentOf(row.measuredOhm, row.limitOhm)}
+                <tr class:is-pending={pa.result === '待判定'}>
                   <td class="gb-mono">{row.code}</td>
                   <td>{row.location}</td>
                   <td class="is-num gb-mono">{row.measuredOhm}</td>
                   <td class="is-num gb-mono">{row.limitOhm}</td>
+                  <td class="is-num gb-mono">{pa.seasonFactor ?? '缺失'}</td>
+                  <td class="is-num gb-mono">{pa.estimatedOhm ?? '—'}</td>
+                  <td>
+                    <QualifyTag
+                      result={pa.result}
+                      estimatedOhm={pa.estimatedOhm}
+                      limitOhm={row.limitOhm}
+                      pendingReason={pa.pendingReason}
+                      factorText={factorLabel(pa)}
+                      size="small"
+                    />
+                  </td>
                 </tr>
               {/each}
             </tbody>
@@ -532,6 +690,27 @@
 
   tr.is-bad td {
     background: #fff6f4;
+  }
+
+  tr.is-pending td {
+    background: #fffaf0;
+  }
+
+  .season-preview {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .month-table td {
+    padding: 4px 8px;
+    text-align: center;
+    font-size: 12px;
+    border: 1px solid #e3e8ee;
+  }
+
+  .gb-ok {
+    color: #1e8449;
   }
 
   .errors {

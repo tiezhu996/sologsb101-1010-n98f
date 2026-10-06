@@ -1,6 +1,6 @@
 # sologsb101-1010 防雷装置检测与接地电阻台账
 
-面向防雷检测机构的纯前端单页应用：对建筑物的接闪器、引下线与接地装置逐项登记，按测点录入接地电阻实测值并与限值比对判定合格与否，最后汇总出检测结论与整改建议。数据全部保存在浏览器本地（IndexedDB），不依赖任何后端服务或外部接口。
+面向防雷检测机构的纯前端单页应用：对建筑物的接闪器、引下线与接地装置逐项登记，按测点录入接地电阻实测值，并按测量月份（或现场实测）季节系数折算为最不利季节估算值后与限值比对判定合格与否，最后汇总出检测结论与整改建议；雨季原始实测值偏小不再直接判合格，报告里原始实测值与估算值并列留存。数据全部保存在浏览器本地（IndexedDB），不依赖任何后端服务或外部接口。
 
 ## 一、Docker 一键启动（推荐）
 
@@ -31,7 +31,7 @@ docker compose up -d --build      # 修改代码后重新构建
 | 路由 | svelte-spa-router 5 | hash 路由，`/buildings`、`/devices`、`/points`、`/verdicts`、`/backup` |
 | 样式 | Tailwind CSS 4（`@tailwindcss/vite`）+ 自定义组件类 | 主题变量走 `@theme` |
 | 状态管理 | Svelte store（`writable` / `derived`） | `buildingStore`、`pointStore`、`rectifyStore` |
-| 持久化 | Dexie 4（IndexedDB，库名 `gblightprot`） | 结构版本 v2 + upgrade 迁移 + liveQuery 订阅 |
+| 持久化 | Dexie 4（IndexedDB，库名 `gblightprot`） | 结构版本 v3 + upgrade 迁移 + liveQuery 订阅 |
 | 构建 | Vite 6 | 产物 `dist/`，交给 nginx 托管 |
 | 容器 | node:20-alpine 构建 → nginx:alpine 运行 | 多阶段构建，运行阶段 `chmod -R a+rX` |
 
@@ -41,9 +41,9 @@ docker compose up -d --build      # 修改代码后重新构建
 | --- | --- | --- | --- |
 | `/buildings` | 建筑物与防雷类别台账 | Building、Device、Point | 新建/编辑/删除建筑物，按用途与防雷类别筛选，卡片回显装置数、测点数、不合格数与合格率 |
 | `/devices` | 接闪器/引下线/接地装置登记 | Device、Building、Point | 登记类型、材质、规格、数量与安装日期，按建筑物与类型筛选，展开查看该装置全部测点 |
-| `/points` | 接地电阻测点录入 | Point、Device | 逐点录实测电阻与限值、批量改写、批量粘贴导入（`编号,位置,实测[,限值]`） |
-| `/verdicts` | 合格判定与整改建议 | Verdict、Point、Rectify | 自动初判（实测 ≤ 限值）、检测人确认生效、批量改判、由不合格判定批量生成整改建议、整改状态机（待整改→已整改→已复检） |
-| `/backup` | 检测结论与结构版本导出 | 全部模型 | 按建筑物出检测结论、全部测点判定一览、全量 JSON 导入导出（覆盖 / 追加两种模式）、清空重建演示数据 |
+| `/points` | 接地电阻测点录入 | Point、Device | 逐点录实测电阻、限值与现场季节系数、批量改写、批量粘贴导入（`编号,位置,实测[,限值]`）；按月份折算的最不利季节估算值即时标红，缺月份 / 系数挂待判定 |
+| `/verdicts` | 合格判定与整改建议 | Verdict、Point、Rectify | 自动初判（实测 × 季节系数 ψ 折算最不利季节估算值 ≤ 限值）、检测人确认生效、批量改判、由不合格判定批量生成整改建议、整改状态机（待整改→已整改→已复检） |
+| `/backup` | 检测结论与结构版本导出 | 全部模型 | 按建筑物出检测结论、全部测点判定一览（原始实测值 / ψ / 最不利估算值并列留存）、全量 JSON 导入导出（覆盖 / 追加两种模式）、清空重建演示数据 |
 
 > 深层 id 场景：本项目的列表与明细集中在同一组路由（建筑物 → 装置 → 测点 → 判定 → 结论），不存在 `/xxx/:id/yyy` 形式的层级深链；筛选条件通过 query 传递（例如 `/points?device=dev_oil_belt`），刷新后仍可复现当前视图。若 query 指向的装置已被删除，页面自动回落到全部测点并给出空态引导，不会白屏。
 
@@ -76,7 +76,7 @@ sologsb101-1010/
         │   ├── stores/           # buildingStore / pointStore / rectifyStore
         │   ├── components/common/# QualifyTag / FilterBar / StatBadge / EmptyPanel
         │   ├── hooks/            # useIdbTable / useQualifyRate
-        │   └── utils/            # resistance.ts / db.ts / export.ts / query.ts
+        │   └── utils/            # resistance.ts（限值比对 / 合格率）/ season.ts（月份系数表 / 现场系数 / 估算与待判定）/ db.ts / export.ts / query.ts
         └── routes/
             ├── index.ts          # 路由表（svelte-spa-router 的 route 映射）
             ├── BuildingList.svelte
@@ -98,11 +98,11 @@ npm run preview    # 预览构建产物
 
 ## 六、数据存储说明
 
-- **存储位置**：浏览器 IndexedDB，库名 `gblightprot`，当前结构版本 `v2`。所有读写经 `frontend/src/lib/utils/db.ts` 与 hooks 封装，组件不直接触碰 Dexie 实例。
+- **存储位置**：浏览器 IndexedDB，库名 `gblightprot`，当前结构版本 `v3`。所有读写经 `frontend/src/lib/utils/db.ts` 与 hooks 封装，组件不直接触碰 Dexie 实例。
 - **数据表**：`buildings`（建筑物）、`devices`（防雷装置）、`points`（接地电阻测点）、`verdicts`（合格判定）、`rectifies`（整改建议）。
-- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳、限值、判定确认标记；调整字段结构时递增 `DB_VERSION` 并补迁移。
-- **首屏播种**：`initDatabase()` 在 `buildings` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 栋建筑物 / 6 个防雷装置 / 9 个测点 / 9 条判定 / 2 条整改建议），其中既有合格样本也有超限样本，便于演示挂红、整改与结论导出。
+- **升级迁移**：`db.version(1)` 保留初版结构；`db.version(2)` 补齐索引并回填时间戳、限值、判定确认标记；`db.version(3)` 给测点补现场季节系数、给判定补最不利季节估算值与系数，并把按雨季实测值直接下的历史判定统一按修正口径重算（缺月份 / 系数改挂待判定）；调整字段结构时递增 `DB_VERSION` 并补迁移。
+- **首屏播种**：`initDatabase()` 在 `buildings` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 栋建筑物 / 6 个防雷装置 / 10 个测点 / 10 条判定 / 6 条整改建议），其中既有合格样本也有估算超限样本与缺月份待判定样本（含「雨季实测合格、修正后超限」和「现场实测系数优先于月份表」两个典型场景），便于演示挂红、整改与结论导出。
 - **实时同步**：`utils/db.ts` 的 `watchTable()` 基于 Dexie `liveQuery` 订阅表变化，Svelte store 自动刷新，页面用 `$store` 只读订阅。
-- **判定规则**：实测电阻 ≤ 限值判合格；限值初始值按防雷类别与装置类型建议（一类/二类接地装置 4 Ω，其余 10 Ω），最终以设计文件与规范条款为准。
+- **判定规则（季节修正）**：雨季土壤湿润，接地电阻实测值偏小，不能直接按当次实测值判合格。系统按测量月份查季节系数 ψ（`utils/season.ts` 的 `SEASON_FACTOR_BY_MONTH`，雨季 6-8 月最小、旱季冬季最大），把实测值折算成**最不利季节（旱季）估算值**后再与限值比对；现场当次实测了季节系数（如四极法比对）就**以现场为准**，没量才用月份表。**合格判定与各处合格率一律以估算值为准，原始实测值只在报告 / 测点明细中另行列存**；检测月份或季节系数缺失的记录不给合格结论，统一标「待判定」并提示补录。限值初始值按防雷类别与装置类型建议（一类/二类接地装置 4 Ω，其余 10 Ω），最终以设计文件与规范条款为准。
 - **备份与恢复**：`/backup` 页可导出包含五张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」；备份时间写入 `localStorage`，页脚与备份页均展示结构版本号。
 - **离线可用**：应用为纯静态资源，无任何网络请求；换浏览器或清空站点数据后数据不跟随，需通过 JSON 备份迁移。

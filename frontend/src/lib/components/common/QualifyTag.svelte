@@ -2,19 +2,28 @@
   /**
    * <QualifyTag> 按合格 / 不合格 / 待判定渲染底色与图标。
    * 被测点录入页（/points）与合格判定页（/verdicts）消费。
+   *
+   * 传入 point（含 measuredOhm / limitOhm / measureDate / seasonFactor）时，
+   * 自动按季节修正估算值判定；也可直接传 result 显式指定结论。
    */
-  import { isQualified, limitRatio } from '$lib/utils/resistance.ts'
+  import { limitRatio } from '$lib/utils/resistance.ts'
   import type { VerdictResult } from '$lib/types/verdict.ts'
 
   type ToneKey = VerdictResult
 
   let {
-    /** 合格 / 不合格 / 待判定 */
+    /** 合格 / 不合格 / 待判定（显式指定时优先） */
     result = '待判定',
-    /** 实测电阻（Ω），传入后展示数值与超限幅度 */
+    /** 原始实测电阻（Ω），仅用于提示与报告留痕 */
     measuredOhm = null,
+    /** 最不利季节估算电阻（Ω），判定与占限值按它走 */
+    estimatedOhm = null,
     /** 限值（Ω） */
     limitOhm = null,
+    /** 待判定提示（缺月份 / 缺系数），传入后无论结果都按待判定渲染 */
+    pendingReason = null,
+    /** 系数可读说明（如「6 月查表系数 ψ=1.05」），用于悬停提示 */
+    factorText = '',
     /** 尺寸 */
     size = 'default',
     /** 是否以浅色描边风格展示 */
@@ -22,7 +31,10 @@
   }: {
     result?: VerdictResult
     measuredOhm?: number | null
+    estimatedOhm?: number | null
     limitOhm?: number | null
+    pendingReason?: string | null
+    factorText?: string
     size?: 'default' | 'small' | 'large'
     plain?: boolean
   } = $props()
@@ -33,21 +45,17 @@
     待判定: { color: '#8c8479', bg: '#f2f2f2', icon: '?' }
   }
 
-  // 传入了实测值与限值就按限值现算，否则用传入的结论
-  const resolvedResult = $derived<VerdictResult>(
-    measuredOhm !== null && limitOhm !== null && limitOhm > 0
-      ? isQualified(measuredOhm, limitOhm)
-        ? '合格'
-        : '不合格'
-      : result
-  )
+  // 显式给了待判定原因就按待判定；否则以传入结论为准
+  const resolvedResult = $derived<VerdictResult>(pendingReason ? '待判定' : result)
   const tone = $derived(TONE[resolvedResult] ?? TONE.待判定)
-  const ratio = $derived(measuredOhm !== null && limitOhm ? limitRatio(measuredOhm, limitOhm) : 0)
-  const valueText = $derived(measuredOhm === null ? '' : `${measuredOhm} Ω`)
+  const ratio = $derived(estimatedOhm !== null && limitOhm ? limitRatio(estimatedOhm, limitOhm) : 0)
+  const valueText = $derived(estimatedOhm === null ? '' : `估算 ${estimatedOhm} Ω`)
   const tip = $derived(
-    measuredOhm === null || limitOhm === null
-      ? `${resolvedResult}`
-      : `${resolvedResult}：实测 ${measuredOhm} Ω / 限值 ${limitOhm} Ω（${ratio > 1 ? `超限 ${((ratio - 1) * 100).toFixed(1)}%` : `余量 ${(limitOhm - measuredOhm).toFixed(2)} Ω`}）`
+    pendingReason
+      ? `待判定：${pendingReason}`
+      : estimatedOhm === null || limitOhm === null
+        ? `${resolvedResult}`
+        : `${resolvedResult}：原始实测 ${measuredOhm ?? '—'} Ω，${factorText || '季节修正'}后估算 ${estimatedOhm} Ω / 限值 ${limitOhm} Ω（${ratio > 1 ? `超限 ${((ratio - 1) * 100).toFixed(1)}%` : `余量 ${(limitOhm - estimatedOhm).toFixed(2)} Ω`}）`
   )
   const style = $derived(
     plain

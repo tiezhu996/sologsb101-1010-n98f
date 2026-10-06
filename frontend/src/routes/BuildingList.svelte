@@ -25,7 +25,8 @@
   import { DB_NAME, initDatabase } from '$lib/utils/db.ts'
   import { COMMON_USAGES, PROTECTION_CLASSES } from '$lib/types/building.ts'
   import type { Building, ProtectionClass } from '$lib/types/building.ts'
-  import { isQualified, qualifyRate, suggestLimitOhm } from '$lib/utils/resistance.ts'
+  import { qualifyRate, suggestLimitOhm } from '$lib/utils/resistance.ts'
+  import { assessPoint } from '$lib/utils/season.ts'
   import { readQuery, writeQuery } from '$lib/utils/query.ts'
   import { useRouter } from '$lib/utils/router.ts'
 
@@ -68,13 +69,14 @@
     protectionClasses: $buildingFilter.protectionClasses as string[]
   })
 
-  /** 建筑物卡片：汇总装置数、测点数、不合格数与合格率 */
+  /** 建筑物卡片：汇总装置数、测点数、不合格数与合格率（按最不利季节估算值判定） */
   const cards = $derived(
     $filteredBuildings.map((building: Building) => {
       const devices = $deviceList.filter((device) => device.buildingId === building.id)
       const deviceIds = new Set(devices.map((device) => device.id))
       const points = $pointList.filter((point) => deviceIds.has(point.deviceId))
-      const flags = points.map((point) => isQualified(point.measuredOhm, point.limitOhm))
+      const results = points.map((point) => assessPoint(point).result)
+      const flags = results.map((result) => result === '合格')
       const pendingRectify = $rectifyList.filter(
         (rectify) => rectify.buildingId === building.id && rectify.state !== '已复检'
       ).length
@@ -83,7 +85,8 @@
         deviceIds,
         deviceCount: devices.length,
         pointCount: points.length,
-        unqualified: flags.filter((flag) => !flag).length,
+        unqualified: results.filter((result) => result === '不合格').length,
+        pending: results.filter((result) => result === '待判定').length,
         rate: qualifyRate(flags),
         pendingRectify
       }
@@ -94,15 +97,16 @@
     buildings: cards.length,
     devices: cards.reduce((sum, card) => sum + card.deviceCount, 0),
     points: cards.reduce((sum, card) => sum + card.pointCount, 0),
-    unqualified: cards.reduce((sum, card) => sum + card.unqualified, 0)
+    unqualified: cards.reduce((sum, card) => sum + card.unqualified, 0),
+    pending: cards.reduce((sum, card) => sum + card.pending, 0)
   })
 
-  /** 筛选结果范围内全部测点的合格率 */
+  /** 筛选结果范围内全部测点的合格率（估算口径，待判定不计入合格数） */
   const overallRate = $derived(
     qualifyRate(
       $pointList
         .filter((point) => cards.some((card) => card.deviceIds.has(point.deviceId)))
-        .map((point) => isQualified(point.measuredOhm, point.limitOhm))
+        .map((point) => assessPoint(point).result === '合格')
     )
   )
 
@@ -251,10 +255,16 @@
     <StatBadge label="防雷装置" value={totals.devices} suffix="处" tone="info" />
     <StatBadge label="接地电阻测点" value={totals.points} suffix="点" tone="default" />
     <StatBadge
-      label="不合格测点"
+      label="估算不合格测点"
       value={totals.unqualified}
       suffix="点"
       tone={totals.unqualified > 0 ? 'danger' : 'success'}
+    />
+    <StatBadge
+      label="待判定测点"
+      value={totals.pending}
+      suffix="点"
+      tone={totals.pending > 0 ? 'warning' : 'success'}
     />
     <StatBadge label="整体合格率" value={overallRate} percent={overallRate} tone="success" />
   </div>
@@ -271,7 +281,12 @@
   {:else}
     <div class="gb-grid-cards">
       {#each cards as card (card.building.id)}
-        <article class="gb-card" class:is-bad={card.unqualified > 0} class:is-ok={card.unqualified === 0}>
+        <article
+          class="gb-card"
+          class:is-bad={card.unqualified > 0}
+          class:is-pending={card.unqualified === 0 && card.pending > 0}
+          class:is-ok={card.unqualified === 0 && card.pending === 0}
+        >
           <header class="card__head">
             <strong class="card__name">{card.building.name}</strong>
             <span class="gb-tag">{card.building.protectionClass}防雷</span>
@@ -289,17 +304,27 @@
             <StatBadge label="装置" value={card.deviceCount} suffix="处" size="small" tone="info" />
             <StatBadge label="测点" value={card.pointCount} suffix="点" size="small" tone="primary" />
             <StatBadge
-              label="不合格"
+              label="估算不合格"
               value={card.unqualified}
               suffix="点"
               size="small"
               tone={card.unqualified > 0 ? 'danger' : 'success'}
+            />
+            <StatBadge
+              label="待判定"
+              value={card.pending}
+              suffix="点"
+              size="small"
+              tone={card.pending > 0 ? 'warning' : 'success'}
             />
             <StatBadge label="合格率" value={card.rate} percent={card.rate} size="small" tone="success" />
           </div>
 
           {#if card.pendingRectify > 0}
             <p class="gb-alert">存在 {card.pendingRectify} 条未完成复检闭环的整改建议</p>
+          {/if}
+          {#if card.pending > 0}
+            <p class="gb-alert">存在 {card.pending} 个缺检测月份 / 季节系数的待判定测点，请补录后再出结论</p>
           {/if}
 
           <footer class="card__actions">
@@ -318,8 +343,8 @@
   {/if}
 
   <p class="gb-hint">
-    数据保存在浏览器本地库 {DB_NAME}（IndexedDB）；初始限值按防雷类别自动建议（一类/二类接地装置 4 Ω，其余 10 Ω），
-    最终以设计文件与规范条款为准。
+    数据保存在浏览器本地库 {DB_NAME}（IndexedDB）；判定与合格率按季节系数把雨季实测值折算成旱季（最不利季节）估算值后比对限值
+    （初始限值：一类/二类接地装置 4 Ω，其余 10 Ω），现场实测系数优先于月份表；最终以设计文件与规范条款为准。
   </p>
 </section>
 

@@ -35,6 +35,7 @@
   import type { RectifyState } from '$lib/types/rectify.ts'
   import { VERDICT_RESULTS } from '$lib/types/verdict.ts'
   import type { VerdictResult } from '$lib/types/verdict.ts'
+  import { factorLabel } from '$lib/utils/season.ts'
   import { readQuery, writeQuery } from '$lib/utils/query.ts'
 
   interface RectifyForm {
@@ -100,7 +101,8 @@
 
   const totals = $derived({
     points: rows.length,
-    unqualified: rows.filter((row) => !row.qualified).length,
+    unqualified: rows.filter((row) => !row.qualified && !row.pending).length,
+    pending: rows.filter((row) => row.pending).length,
     unconfirmed: rows.filter((row) => !row.verdict?.confirmed).length,
     inconsistent: rows.filter((row) => row.verdict && !row.consistent).length
   })
@@ -110,8 +112,9 @@
       .map((point) => {
         const device = $deviceList.find((item) => item.id === point.deviceId)
         const building = device ? $buildingList.find((item) => item.id === device.buildingId) : undefined
+        const pa = $verdictRows.find((item) => item.point.id === point.id)?.assessment
         return {
-          label: `${building?.name ?? '未知'} · ${point.code}（${point.measuredOhm} Ω）`,
+          label: `${building?.name ?? '未知'} · ${point.code}（实测 ${point.measuredOhm} Ω / 估算 ${pa?.estimatedOhm ?? '—'} Ω）`,
           value: point.id
         }
       })
@@ -133,7 +136,7 @@
 
   async function runAutoJudge(pointId: string): Promise<void> {
     await autoJudgePoint(pointId, inspector)
-    notice = '已按实测值与限值比对给出初判，请确认生效。'
+    notice = '已按季节修正估算值与限值比对给出初判；缺月份 / 系数的测点挂待判定，请补录后再确认。'
   }
 
   async function confirmOne(row: (typeof rows)[number]): Promise<void> {
@@ -277,7 +280,8 @@
     <div>
       <h2 class="page__title">合格判定与整改建议</h2>
       <p class="gb-hint">
-        实测值与限值比对自动给出初判，检测人确认后生效；不合格测点可一键批量生成整改建议，并跟踪整改状态机到复检闭环。
+        实测值先按季节系数折算成最不利季节（旱季）估算值，自动初判与合格率一律以估算值为准；现场实测系数优先于月份表。
+        检测人确认后结论生效；缺检测月份 / 系数的测点挂「待判定」，补录后再判。不合格测点可一键生成整改建议并跟踪复检闭环。
       </p>
     </div>
     <div class="page__actions">
@@ -297,12 +301,18 @@
   {/if}
 
   <div class="gb-stats-row">
-    <StatBadge label="待判定测点" value={totals.points} suffix="点" tone="primary" />
+    <StatBadge label="测点总数" value={totals.points} suffix="点" tone="primary" />
     <StatBadge
-      label="不合格"
+      label="估算不合格"
       value={totals.unqualified}
       suffix="点"
       tone={totals.unqualified > 0 ? 'danger' : 'success'}
+    />
+    <StatBadge
+      label="待判定（缺月份/系数）"
+      value={totals.pending}
+      suffix="点"
+      tone={totals.pending > 0 ? 'warning' : 'success'}
     />
     <StatBadge label="未确认" value={totals.unconfirmed} suffix="条" tone={totals.unconfirmed > 0 ? 'warning' : 'success'} />
     <StatBadge label="整体合格率" value={$qualifyStats.overall.rate} percent={$qualifyStats.overall.rate} tone="success" />
@@ -350,7 +360,7 @@
     <div class="gb-panel">
       <div class="gb-panel-title">
         <h3>判定清单</h3>
-        <span class="gb-hint">勾选后可批量改判；「初判不一致」表示检测人结论与自动初判不同。</span>
+        <span class="gb-hint">勾选后可批量改判；「初判不一致」表示检测人结论与自动初判不同。自动初判按「原始实测 × 季节系数 ψ」的最不利季节估算值比对限值。</span>
       </div>
       <table class="gb-table">
         <thead>
@@ -360,7 +370,9 @@
             </th>
             <th>测点</th>
             <th>建筑物 / 装置</th>
-            <th class="is-num">实测（Ω）</th>
+            <th class="is-num">原始实测（Ω）</th>
+            <th class="is-num">ψ / 来源</th>
+            <th class="is-num">最不利估算（Ω）</th>
             <th class="is-num">限值（Ω）</th>
             <th>自动初判</th>
             <th>检测人结论</th>
@@ -370,7 +382,7 @@
         </thead>
         <tbody>
           {#each rows as row (row.point.id)}
-            <tr class:is-bad={!row.qualified}>
+            <tr class:is-bad={!row.qualified && !row.pending} class:is-pending={row.pending}>
               <td class="is-check">
                 <input type="checkbox" checked={selected.includes(row.point.id)} onchange={() => toggleSelect(row.point.id)} />
               </td>
@@ -380,14 +392,43 @@
               </td>
               <td>
                 <div>{row.building?.name ?? '未知建筑物'}</div>
-                <div class="gb-hint">{row.device?.type ?? '未知装置'} · {row.point.measureDate}</div>
+                <div class="gb-hint">{row.device?.type ?? '未知装置'} · {row.point.measureDate || '缺检测月份'}</div>
               </td>
               <td class="is-num gb-mono">{row.point.measuredOhm}</td>
+              <td class="is-num gb-mono">
+                {#if row.assessment.seasonFactor !== null}
+                  {row.assessment.seasonFactor}
+                  <div class="gb-hint">{row.assessment.factorSource === '现场实测量' ? '现场实测' : `${row.assessment.month ?? '?'}月查表`}</div>
+                {:else}
+                  <span class="gb-warning">缺失</span>
+                {/if}
+              </td>
+              <td class="is-num gb-mono">{row.assessment.estimatedOhm ?? '—'}</td>
               <td class="is-num gb-mono">{row.point.limitOhm}</td>
-              <td><QualifyTag result={row.autoResult} size="small" plain /></td>
+              <td>
+                <QualifyTag
+                  result={row.autoResult}
+                  measuredOhm={row.point.measuredOhm}
+                  estimatedOhm={row.assessment.estimatedOhm}
+                  limitOhm={row.point.limitOhm}
+                  pendingReason={row.assessment.pendingReason}
+                  factorText={factorLabel(row.assessment)}
+                  size="small"
+                  plain
+                />
+                {#if row.assessment.pendingReason}
+                  <div class="gb-warning" title={row.assessment.pendingReason}>请补录月份/系数</div>
+                {/if}
+              </td>
               <td>
                 {#if row.verdict}
-                  <QualifyTag result={row.verdict.result} size="small" />
+                  <QualifyTag
+                    result={row.verdict.result}
+                    measuredOhm={row.point.measuredOhm}
+                    estimatedOhm={row.verdict.estimatedOhm ?? row.assessment.estimatedOhm}
+                    limitOhm={row.point.limitOhm}
+                    size="small"
+                  />
                   <div class="gb-hint">
                     {row.verdict.confirmed ? '已确认生效' : '待检测人确认'} · {row.verdict.inspector || '未署名'}
                   </div>
@@ -599,6 +640,10 @@
 
   tr.is-bad td {
     background: #fff6f4;
+  }
+
+  tr.is-pending td {
+    background: #fffaf0;
   }
 
   .template-row {

@@ -29,21 +29,25 @@ export function formatOhm(ohm: number): string {
   return `${round(ohm, 2)} Ω`
 }
 
-/** 限值比对：返回是否合格 */
-export function isQualified(measuredOhm: number, limitOhm: number): boolean {
-  if (!Number.isFinite(measuredOhm) || !Number.isFinite(limitOhm) || limitOhm <= 0) return false
-  return measuredOhm <= limitOhm
+/**
+ * 限值比对：返回某电阻值是否不大于限值。
+ * 注意：合格判定必须传入季节修正后的「最不利季节估算值」（见 utils/season.ts），
+ * 不能直接传雨季原始实测值；本函数只做纯数值比对，不感知季节口径。
+ */
+export function isQualified(resistanceOhm: number, limitOhm: number): boolean {
+  if (!Number.isFinite(resistanceOhm) || !Number.isFinite(limitOhm) || limitOhm <= 0) return false
+  return resistanceOhm <= limitOhm
 }
 
-/** 合格余量：限值 - 实测（正数为余量，负数为超限幅度） */
-export function marginOhm(measuredOhm: number, limitOhm: number): number {
-  return round(limitOhm - measuredOhm, 3)
+/** 合格余量：限值 - 估算值（正数为余量，负数为超限幅度） */
+export function marginOhm(estimatedOhm: number, limitOhm: number): number {
+  return round(limitOhm - estimatedOhm, 3)
 }
 
-/** 超限比例：实测 / 限值（> 1 表示超限） */
-export function limitRatio(measuredOhm: number, limitOhm: number): number {
+/** 超限比例：估算 / 限值（> 1 表示超限） */
+export function limitRatio(resistanceOhm: number, limitOhm: number): number {
   if (!Number.isFinite(limitOhm) || limitOhm <= 0) return 0
-  return round(measuredOhm / limitOhm, 3)
+  return round(resistanceOhm / limitOhm, 3)
 }
 
 /** 合格率（0-100，保留 1 位）：传入逐点是否合格的布尔数组 */
@@ -53,11 +57,14 @@ export function qualifyRate(flags: boolean[]): number {
   return round((passed / flags.length) * 100, 1)
 }
 
-/** 按分档统计合格率：返回各档位计数 */
-export function qualifyBuckets(flags: boolean[]): { total: number; passed: number; failed: number; rate: number } {
+/**
+ * 按分档统计合格率：布尔口径只区分合格 / 不合格，无法表达「待判定」。
+ * 含待判定的季节修正场景请改用 utils/season.ts 的 judgeBuckets（直接收判定结果）。
+ */
+export function qualifyBuckets(flags: boolean[]): { total: number; passed: number; failed: number; pending: number; rate: number } {
   const total = flags.length
   const passed = flags.filter((flag) => flag).length
-  return { total, passed, failed: total - passed, rate: qualifyRate(flags) }
+  return { total, passed, failed: total - passed, pending: 0, rate: qualifyRate(flags) }
 }
 
 /**
@@ -70,7 +77,10 @@ export function suggestLimitOhm(protectionClass: ProtectionClass, deviceType: De
   return 10
 }
 
-/** 电阻温度/土壤修正的简易提示：季节系数修正后的估算值 */
+/**
+ * 季节修正后的最不利季节估算电阻：实测 × 季节系数 ψ。
+ * 完整口径（月份查表 / 现场系数优先 / 缺月份或系数转待判定）见 utils/season.ts。
+ */
 export function seasonCorrected(measuredOhm: number, seasonFactor = 1.2): number {
   return round(measuredOhm * seasonFactor, 3)
 }

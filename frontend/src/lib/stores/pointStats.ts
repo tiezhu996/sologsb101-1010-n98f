@@ -9,17 +9,18 @@
 import { derived } from 'svelte/store'
 import { deviceList } from '$lib/stores/buildingStore'
 import { pointList } from '$lib/stores/pointStore'
-import { isQualified } from '$lib/utils/resistance'
+import { assessPoint } from '$lib/utils/season'
 
 /** 某装置的测点统计 */
 export interface DevicePointStats {
   count: number
   unqualified: number
+  pending: number
   minOhm: number
   maxOhm: number
 }
 
-/** 装置 id → 测点数 / 不合格数 / 实测电阻极值 */
+/** 装置 id → 测点数 / 不合格数 / 待判定数 / 实测电阻极值（原始实测值极值，供台账参考） */
 export const pointStatsByDevice = derived([pointList, deviceList], ([$points, $devices]) => {
   const stats: Record<string, DevicePointStats> = {}
   $devices.forEach((device) => {
@@ -27,7 +28,8 @@ export const pointStatsByDevice = derived([pointList, deviceList], ([$points, $d
     const values = list.map((point) => point.measuredOhm)
     stats[device.id] = {
       count: list.length,
-      unqualified: list.filter((point) => !isQualified(point.measuredOhm, point.limitOhm)).length,
+      unqualified: list.filter((point) => assessPoint(point).result === '不合格').length,
+      pending: list.filter((point) => assessPoint(point).result === '待判定').length,
       minOhm: values.length > 0 ? Math.min(...values) : 0,
       maxOhm: values.length > 0 ? Math.max(...values) : 0
     }

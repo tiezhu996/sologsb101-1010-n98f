@@ -168,6 +168,11 @@ body {
   font-weight: 600;
 }
 
+.gb-warning {
+  color: #b9770e;
+  font-weight: 600;
+}
+
 /* 表单 */
 .gb-field {
   display: flex;
@@ -308,6 +313,10 @@ body {
 
 .gb-card.is-bad {
   border-left-color: var(--color-bad);
+}
+
+.gb-card.is-pending {
+  border-left-color: #d68910;
 }
 
 .gb-card.is-ok {

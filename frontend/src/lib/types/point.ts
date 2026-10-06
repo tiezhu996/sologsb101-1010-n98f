@@ -7,13 +7,18 @@ export interface Point {
   code: string
   /** 测点位置描述 */
   location: string
-  /** 实测接地电阻（Ω） */
+  /** 实测接地电阻（Ω），雨季原始读数；判定与合格率一律不直接使用它 */
   measuredOhm: number
   /** 限值（Ω），按防雷类别与装置类型给出初始值 */
   limitOhm: number
+  /**
+   * 现场当次实测的季节系数 ψ（如四极法比对旱季土壤电阻率得出）。
+   * 量了就以现场为准；留空才按 measureDate 所在月份查月份系数表。
+   */
+  seasonFactor: number | null
   /** 检测仪器与编号 */
   meter: string
-  /** 检测日期 */
+  /** 检测日期（YYYY-MM-DD），用于查月份季节系数；缺失则该测点待判定 */
   measureDate: string
   createdAt: number
   updatedAt: number
@@ -25,6 +30,8 @@ export interface PointDraft {
   location: string
   measuredOhm: number
   limitOhm: number
+  /** 现场实测季节系数；null 表示没量，回落到月份表 */
+  seasonFactor: number | null
   meter: string
   measureDate: string
 }
@@ -35,6 +42,7 @@ export function createEmptyPointDraft(limitOhm = 10, meter = '', measureDate = '
     location: '',
     measuredOhm: 0,
     limitOhm,
+    seasonFactor: null,
     meter,
     measureDate: measureDate || new Date().toISOString().slice(0, 10)
   }

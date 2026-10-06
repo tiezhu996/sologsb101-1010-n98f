@@ -11,6 +11,7 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '$lib/utils/db'
+import { assessPoint } from '$lib/utils/season'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['buildings', 'devices', 'points', 'verdicts', 'rectifies'] as const
@@ -154,7 +155,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   return { ...payload, buildings, devices, points, verdicts, rectifies }
 }
 
-/** 检测结论行：按建筑物汇总测点数、不合格数与结论文字 */
+/** 检测结论行：按建筑物汇总测点数、待判定 / 不合格数与结论文字 */
 export interface ConclusionLine {
   buildingId: string
   buildingName: string
@@ -162,15 +163,21 @@ export interface ConclusionLine {
   protectionClass: string
   deviceCount: number
   pointCount: number
+  /** 季节修正估算后不合格数 */
   unqualifiedCount: number
+  /** 缺检测月份 / 季节系数而无法判定的点数 */
+  pendingCount: number
   qualifyRatePct: number
-  /** 最不利（实测/限值比最大）测点摘要 */
+  /** 最不利点（估算 / 限值比最大的已判定测点）摘要 */
   worstPoint: string
   conclusion: string
   advice: string
 }
 
-/** 生成按建筑物的检测结论与整改建议汇总 */
+/**
+ * 生成按建筑物的检测结论与整改建议汇总。
+ * 合格 / 不合格 / 合格率均以最不利季节估算值为准；原始实测值只进 worstPoint / 报告明细留存。
+ */
 export function buildConclusionLines(payload: BackupPayload): ConclusionLine[] {
   const deviceById = new Map(payload.devices.map((device) => [device.id, device]))
   const verdictByPoint = new Map(payload.verdicts.map((verdict) => [verdict.pointId, verdict]))
@@ -179,36 +186,56 @@ export function buildConclusionLines(payload: BackupPayload): ConclusionLine[] {
     const devices = payload.devices.filter((device) => device.buildingId === building.id)
     const deviceIds = new Set(devices.map((device) => device.id))
     const points = payload.points.filter((point) => deviceIds.has(point.deviceId))
-    const verdicts = points
-      .map((point) => verdictByPoint.get(point.id))
-      .filter((verdict): verdict is NonNullable<typeof verdict> => Boolean(verdict))
-    const unqualified = verdicts.filter((verdict) => verdict.result === '不合格')
+
+    // 逐点确定生效结果：优先检测人确认 / 已写入的判定，缺失时按季节修正现算
+    const assessed = points.map((point) => {
+      const assessment = assessPoint(point)
+      const verdict = verdictByPoint.get(point.id)
+      const result = verdict && verdict.result !== '待判定' ? verdict.result : assessment.result
+      const estimatedOhm = verdict?.estimatedOhm ?? assessment.estimatedOhm
+      const seasonFactor = verdict?.seasonFactor ?? assessment.seasonFactor
+      return { point, assessment, verdict, result, estimatedOhm, seasonFactor }
+    })
+
+    const unqualified = assessed.filter((item) => item.result === '不合格')
+    const pending = assessed.filter((item) => item.result === '待判定')
+    const passed = assessed.filter((item) => item.result === '合格').length
+
     let worstRatio = 0
     let worstPoint = '无测点数据'
-    points.forEach((point) => {
-      const ratio = point.limitOhm > 0 ? point.measuredOhm / point.limitOhm : 0
-      if (ratio > worstRatio) {
-        worstRatio = ratio
-        const device = deviceById.get(point.deviceId)
-        worstPoint = `${point.code}（${device?.type ?? '装置'}）实测 ${point.measuredOhm} Ω / 限值 ${point.limitOhm} Ω`
-      }
-    })
+    assessed
+      .filter((item) => item.estimatedOhm !== null)
+      .forEach((item) => {
+        const ratio = item.point.limitOhm > 0 ? (item.estimatedOhm as number) / item.point.limitOhm : 0
+        if (ratio > worstRatio) {
+          worstRatio = ratio
+          const device = deviceById.get(item.point.deviceId)
+          worstPoint =
+            `${item.point.code}（${device?.type ?? '装置'}）原始实测 ${item.point.measuredOhm} Ω × ψ=${item.seasonFactor ?? '?'} → ` +
+            `最不利估算 ${item.estimatedOhm} Ω / 限值 ${item.point.limitOhm} Ω`
+        }
+      })
+
     const qualifyRatePct =
-      verdicts.length === 0
-        ? 0
-        : Number((((verdicts.length - unqualified.length) / verdicts.length) * 100).toFixed(1))
+      assessed.length === 0 ? 0 : Number(((passed / assessed.length) * 100).toFixed(1))
     const rectifies = payload.rectifies.filter((rectify) => rectify.buildingId === building.id)
-    const pending = rectifies.filter((rectify) => rectify.state !== '已复检').length
+    const pendingRectify = rectifies.filter((rectify) => rectify.state !== '已复检').length
     const conclusion =
       points.length === 0
         ? '未录入测点，无法出具结论'
-        : unqualified.length === 0
-          ? `所检 ${points.length} 个测点接地电阻均不大于限值，判定合格`
-          : `所检 ${points.length} 个测点中 ${unqualified.length} 个不合格，判定不合格`
+        : pending.length > 0
+          ? `所检 ${points.length} 个测点中 ${pending.length} 个缺检测月份 / 季节系数，暂判待判定、需补录后复审；已判 ${passed} 合格 / ${unqualified.length} 不合格（按最不利季节估算值）`
+          : unqualified.length === 0
+            ? `所检 ${points.length} 个测点经季节修正折算最不利季节值后均不大于限值，判定合格（原始实测值见测点明细）`
+            : `所检 ${points.length} 个测点经季节修正后 ${unqualified.length} 个估算值超限，判定不合格（雨季原始实测值见测点明细）`
     const advice =
-      rectifies.length === 0
-        ? '无需整改，建议按周期复测'
-        : `已生成 ${rectifies.length} 条整改建议，其中 ${pending} 条未完成复检闭环`
+      pending.length > 0
+        ? `请先补录 ${pending.length} 个待判定测点的检测月份或现场季节系数${
+            rectifies.length > 0 ? `；另有 ${pendingRectify} 条整改未完成复检闭环` : ''
+          }`
+        : rectifies.length === 0
+          ? '无需整改，建议旱季按周期复测'
+          : `已生成 ${rectifies.length} 条整改建议，其中 ${pendingRectify} 条未完成复检闭环`
     return {
       buildingId: building.id,
       buildingName: building.name,
@@ -217,6 +244,7 @@ export function buildConclusionLines(payload: BackupPayload): ConclusionLine[] {
       deviceCount: devices.length,
       pointCount: points.length,
       unqualifiedCount: unqualified.length,
+      pendingCount: pending.length,
       qualifyRatePct,
       worstPoint,
       conclusion,

@@ -16,7 +16,8 @@
   import { pointList } from '$lib/stores/pointStore.ts'
   import { rectifyList } from '$lib/stores/rectifyStore.ts'
   import { DB_NAME, DB_VERSION } from '$lib/utils/db.ts'
-  import { qualifyRate, isQualified } from '$lib/utils/resistance.ts'
+  import { qualifyRate } from '$lib/utils/resistance.ts'
+  import { assessPoint } from '$lib/utils/season.ts'
 
   const { push } = useRouter()
 
@@ -25,8 +26,11 @@
   const activeRoute = $derived(resolveRoute(current))
 
   const pointCount = $derived($pointList.length)
-  const unqualifiedCount = $derived($pointList.filter((point) => !isQualified(point.measuredOhm, point.limitOhm)).length)
-  const rate = $derived(qualifyRate($pointList.map((point) => isQualified(point.measuredOhm, point.limitOhm))))
+  /** 合格判定一律按季节修正后的最不利季节估算值；待判定不计合格也不计入导航红点 */
+  const pointAssessments = $derived($pointList.map((point) => assessPoint(point)))
+  const unqualifiedCount = $derived(pointAssessments.filter((item) => item.result === '不合格').length)
+  const pendingCount = $derived(pointAssessments.filter((item) => item.result === '待判定').length)
+  const rate = $derived(qualifyRate(pointAssessments.map((item) => item.result === '合格')))
   const pendingRectify = $derived($rectifyList.filter((rectify) => rectify.state !== '已复检').length)
 
   /** 导航高亮：根路径也算建筑物台账 */
@@ -88,7 +92,7 @@
       本地库 {DB_NAME} · 结构版本 v{DB_VERSION} · 数据仅存于本浏览器 IndexedDB，不上传任何服务器。
     </span>
     <span>
-      建筑物 {$buildingList.length} · 装置 {$deviceList.length} · 测点 {pointCount} · 不合格 {unqualifiedCount} · 合格率 {rate}% · 未闭环整改 {pendingRectify}
+      建筑物 {$buildingList.length} · 装置 {$deviceList.length} · 测点 {pointCount} · 估算不合格 {unqualifiedCount} · 待判定 {pendingCount} · 合格率 {rate}% · 未闭环整改 {pendingRectify}
     </span>
   </footer>
 </div>

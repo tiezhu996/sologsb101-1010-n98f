@@ -30,6 +30,7 @@
   } from '$lib/utils/export.ts'
   import type { ConclusionLine, CountMap } from '$lib/utils/export.ts'
   import { RECTIFY_STATES } from '$lib/types/rectify.ts'
+  import { evaluateSeasonPoint } from '$lib/utils/season.ts'
 
   const EMPTY_COUNTS: CountMap = { buildings: 0, devices: 0, points: 0, verdicts: 0, rectifies: 0 }
 
@@ -114,7 +115,7 @@
     const text = conclusions
       .map(
         (line) =>
-          `${line.buildingName}（${line.protectionClass} / ${line.usage}）：装置 ${line.deviceCount} 处，测点 ${line.pointCount} 个，不合格 ${line.unqualifiedCount} 个，合格率 ${line.qualifyRatePct}%。${line.conclusion}。最不利点：${line.worstPoint}。${line.advice}`
+          `${line.buildingName}（${line.protectionClass} / ${line.usage}）：装置 ${line.deviceCount} 处，测点 ${line.pointCount} 个，不合格 ${line.unqualifiedCount} 个，待判定 ${line.pendingCount} 个，合格率（最不利季节估算口径）${line.qualifyRatePct}%。${line.conclusion}。最不利点：${line.worstPoint}。${line.advice}`
       )
       .join('\n')
     try {
@@ -125,15 +126,24 @@
     }
   }
 
-  /** 全部测点判定行：按占限值比例降序，便于核对最不利点 */
+  /** 全部测点判定行：按季节修正后的估算值占限值比例降序，便于核对最不利点 */
   const pointRows = $derived(
     $pointList
       .map((point) => {
         const device = $deviceList.find((item) => item.id === point.deviceId)
         const building = device ? $buildingList.find((item) => item.id === device.buildingId) : undefined
-        return { point, device, building }
+        const season = evaluateSeasonPoint({
+          measuredOhm: point.measuredOhm,
+          limitOhm: point.limitOhm,
+          measureDate: point.measureDate,
+          siteSeasonFactor: point.siteSeasonFactor
+        })
+        return { point, device, building, season }
       })
-      .sort((a, b) => b.point.measuredOhm / b.point.limitOhm - a.point.measuredOhm / a.point.limitOhm)
+      .sort(
+        (a, b) =>
+          (b.season.estimatedOhm ?? 0) / b.point.limitOhm - (a.season.estimatedOhm ?? 0) / a.point.limitOhm
+      )
   )
 
   refresh()
@@ -146,7 +156,7 @@
     <div>
       <h2 class="page__title">检测结论与结构版本导出</h2>
       <p class="gb-hint">
-        按建筑物汇总检测结论（装置数、测点数、不合格数、合格率与最不利点），并可导出 / 导入全量 JSON 备份。
+        按建筑物汇总检测结论（装置数、测点数、不合格数、待判定数、合格率与最不利点）。判定与合格率均以季节修正后的最不利季节估算值为准，原始实测值随最不利点摘要保留；可导出 / 导入全量 JSON 备份。
       </p>
     </div>
     <div class="page__actions">
@@ -165,12 +175,18 @@
     <StatBadge label="防雷装置" value={counts.devices} suffix="处" tone="info" />
     <StatBadge label="接地电阻测点" value={counts.points} suffix="点" tone="default" />
     <StatBadge
-      label="不合格测点"
+      label="不合格测点（估算口径）"
       value={$qualifyStats.overall.failed}
       suffix="点"
       tone={$qualifyStats.overall.failed > 0 ? 'danger' : 'success'}
     />
-    <StatBadge label="整体合格率" value={$qualifyStats.overall.rate} percent={$qualifyStats.overall.rate} tone="success" />
+    <StatBadge
+      label="待判定（缺月份/系数）"
+      value={$qualifyStats.overall.pending}
+      suffix="点"
+      tone={$qualifyStats.overall.pending > 0 ? 'warning' : 'success'}
+    />
+    <StatBadge label="整体合格率（估算）" value={$qualifyStats.overall.rate} percent={$qualifyStats.overall.rate} tone="success" />
   </div>
 
   <div class="gb-panel">
@@ -193,14 +209,15 @@
             <th class="is-num">装置</th>
             <th class="is-num">测点</th>
             <th class="is-num">不合格</th>
+            <th class="is-num">待判定</th>
             <th>检测结论</th>
-            <th>最不利点</th>
+            <th>最不利点（含原始实测值）</th>
             <th>整改建议</th>
           </tr>
         </thead>
         <tbody>
           {#each conclusions as line (line.buildingId)}
-            <tr class:is-bad={line.unqualifiedCount > 0}>
+            <tr class:is-bad={line.unqualifiedCount > 0} class:is-pending={line.unqualifiedCount === 0 && line.pendingCount > 0}>
               <td>{line.buildingName}</td>
               <td>
                 <span class="gb-tag">{line.protectionClass}</span>
@@ -209,9 +226,12 @@
               <td class="is-num gb-mono">{line.deviceCount}</td>
               <td class="is-num gb-mono">{line.pointCount}</td>
               <td class="is-num gb-mono">{line.unqualifiedCount}</td>
+              <td class="is-num gb-mono">
+                {#if line.pendingCount > 0}<span class="gb-warn">{line.pendingCount}</span>{:else}0{/if}
+              </td>
               <td>
                 <div>{line.conclusion}</div>
-                <div class="gb-hint">合格率 {line.qualifyRatePct}%</div>
+                <div class="gb-hint">合格率（估算口径）{line.qualifyRatePct}%</div>
               </td>
               <td class="gb-hint">{line.worstPoint}</td>
               <td class="gb-hint">{line.advice}</td>
@@ -225,7 +245,7 @@
   <div class="gb-panel">
     <div class="gb-panel-title">
       <h3>全部测点判定一览</h3>
-      <span class="gb-hint">按占限值比例降序，便于出具结论时快速核对最不利点</span>
+      <span class="gb-hint">按最不利季节估算值占限值比例降序；报告另存原始实测值，判定一律以估算值为准</span>
     </div>
     {#if pointRows.length === 0}
       <EmptyPanel title="还没有测点" description="先录入接地电阻测点，再生成结论。" compact />
@@ -236,7 +256,9 @@
             <th>建筑物</th>
             <th>装置</th>
             <th>测点编号</th>
-            <th class="is-num">实测（Ω）</th>
+            <th class="is-num">原始实测（Ω）</th>
+            <th class="is-num">季节系数</th>
+            <th class="is-num">最不利估算（Ω）</th>
             <th class="is-num">限值（Ω）</th>
             <th>判定</th>
             <th>检测日期</th>
@@ -244,14 +266,35 @@
         </thead>
         <tbody>
           {#each pointRows as row (row.point.id)}
-            <tr>
+            <tr class:is-pending={row.season.result === '待判定'}>
               <td>{row.building?.name ?? '未知建筑物'}</td>
               <td><span class="gb-tag">{row.device?.type ?? '未知装置'}</span></td>
               <td class="gb-mono">{row.point.code}</td>
               <td class="is-num gb-mono">{row.point.measuredOhm}</td>
+              <td class="is-num gb-mono">
+                {#if row.season.factor !== null}
+                  {row.season.factor.toFixed(2)}
+                  <span class="gb-hint">（{row.season.factorSource}）</span>
+                {:else}
+                  <span class="gb-warn">缺</span>
+                {/if}
+              </td>
+              <td class="is-num gb-mono">{row.season.estimatedOhm ?? '—'}</td>
               <td class="is-num gb-mono">{row.point.limitOhm}</td>
-              <td><QualifyTag measuredOhm={row.point.measuredOhm} limitOhm={row.point.limitOhm} size="small" /></td>
-              <td class="gb-mono">{row.point.measureDate}</td>
+              <td>
+                <QualifyTag
+                  measuredOhm={row.point.measuredOhm}
+                  limitOhm={row.point.limitOhm}
+                  season={row.season}
+                  size="small"
+                />
+                {#if row.season.result === '待判定'}
+                  <div class="gb-warn">{row.season.missingReason}，请补录</div>
+                {/if}
+              </td>
+              <td class="gb-mono">
+                {#if row.point.measureDate}{row.point.measureDate}{:else}<span class="gb-warn">缺月份</span>{/if}
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -348,5 +391,14 @@
 
   tr.is-bad td {
     background: #fff6f4;
+  }
+
+  tr.is-pending td {
+    background: #fdf8ee;
+  }
+
+  .gb-warn {
+    color: #9a6a00;
+    font-weight: 600;
   }
 </style>

@@ -6,12 +6,28 @@
 import { derived, get, writable } from 'svelte/store'
 import { db, watchTable } from '$lib/utils/db'
 import type { Verdict, VerdictResult } from '$lib/types/verdict'
-import { defaultBasis, judgePoint } from '$lib/types/verdict'
+import { buildBasisWithSeason, seasonSnapshot } from '$lib/types/verdict'
 import type { Rectify, RectifyFilterState, RectifyState } from '$lib/types/rectify'
 import { RECTIFY_STATES, RECTIFY_TRANSITIONS, SUGGESTION_TEMPLATES, createEmptyRectifyFilter } from '$lib/types/rectify'
 import { buildingList, deviceList } from '$lib/stores/buildingStore'
 import { pointList } from '$lib/stores/pointStore'
-import { isQualified, qualifyRate } from '$lib/utils/resistance'
+import { judgeBuckets } from '$lib/utils/resistance'
+import { evaluateSeasonPoint, type PointSeasonEvaluation } from '$lib/utils/season'
+
+/** 取测点的季节修正评价（判定台、合格率与整改生成共用同一口径） */
+function evaluatePoint(point: {
+  measuredOhm: number
+  limitOhm: number
+  measureDate: string
+  siteSeasonFactor: number | null
+}): PointSeasonEvaluation {
+  return evaluateSeasonPoint({
+    measuredOhm: point.measuredOhm,
+    limitOhm: point.limitOhm,
+    measureDate: point.measureDate,
+    siteSeasonFactor: point.siteSeasonFactor
+  })
+}
 
 /** 响应式判定集合 */
 export const verdictList = writable<Verdict[]>([])
@@ -36,66 +52,81 @@ export const verdictRows = derived(
       const device = $devices.find((item) => item.id === point.deviceId)
       const building = device ? $buildings.find((item) => item.id === device.buildingId) : undefined
       const verdict = $verdicts.find((item) => item.pointId === point.id) ?? null
-      const auto = judgePoint(point.measuredOhm, point.limitOhm)
+      const season = evaluatePoint(point)
+      const auto = season.result
       return {
         point,
         device,
         building,
         verdict,
+        /** 季节修正评价（估算值 / 系数 / 来源 / 缺失原因） */
+        season,
         autoResult: auto,
         /** 初判与检测人结论是否一致 */
         consistent: verdict === null ? false : verdict.result === auto,
-        qualified: verdict ? verdict.result === '合格' : auto === '合格'
+        /** 三态：合格 true / 不合格 false / 待判定 null */
+        qualified:
+          verdict && verdict.result !== '待判定'
+            ? verdict.result === '合格'
+            : auto === '合格'
+              ? true
+              : auto === '不合格'
+                ? false
+                : null
       }
     })
 )
 
-/** 合格率派生值：全部测点、按建筑物、按装置 */
+/** 合格率派生值：全部测点、按建筑物、按装置（均以最不利季节估算值为准） */
 export const qualifyStats = derived([pointList, verdictList, deviceList, buildingList], ([$points, $verdicts, $devices, $buildings]) => {
-  const qualifiedOf = (pointId: string, measuredOhm: number, limitOhm: number): boolean => {
-    const verdict = $verdicts.find((item) => item.pointId === pointId)
-    if (verdict && verdict.result !== '待判定') return verdict.result === '合格'
-    return isQualified(measuredOhm, limitOhm)
+  /** 测点的有效结论：已确认 / 已给出的人工结论优先，否则取季节修正初算；待判定返回 null */
+  const resultOf = (point: {
+    id: string
+    measuredOhm: number
+    limitOhm: number
+    measureDate: string
+    siteSeasonFactor: number | null
+  }): '合格' | '不合格' | '待判定' => {
+    const verdict = $verdicts.find((item) => item.pointId === point.id)
+    if (verdict) return verdict.result
+    return evaluatePoint(point).result
   }
-  const flags = $points.map((point) => qualifiedOf(point.id, point.measuredOhm, point.limitOhm))
-  const overall = {
-    total: flags.length,
-    passed: flags.filter(Boolean).length,
-    failed: flags.filter((flag) => !flag).length,
-    rate: qualifyRate(flags)
-  }
+
+  const overall = judgeBuckets($points.map((point) => resultOf(point)))
 
   const byBuilding = $buildings.map((building) => {
     const deviceIds = new Set($devices.filter((device) => device.buildingId === building.id).map((device) => device.id))
     const points = $points.filter((point) => deviceIds.has(point.deviceId))
-    const buildingFlags = points.map((point) => qualifiedOf(point.id, point.measuredOhm, point.limitOhm))
+    const buckets = judgeBuckets(points.map((point) => resultOf(point)))
     return {
       buildingId: building.id,
       buildingName: building.name,
-      total: buildingFlags.length,
-      failed: buildingFlags.filter((flag) => !flag).length,
-      rate: qualifyRate(buildingFlags)
+      total: buckets.total,
+      failed: buckets.failed,
+      pending: buckets.pending,
+      rate: buckets.rate
     }
   })
 
   const byDevice = $devices.map((device) => {
     const points = $points.filter((point) => point.deviceId === device.id)
-    const deviceFlags = points.map((point) => qualifiedOf(point.id, point.measuredOhm, point.limitOhm))
+    const buckets = judgeBuckets(points.map((point) => resultOf(point)))
     return {
       deviceId: device.id,
       deviceType: device.type,
-      total: deviceFlags.length,
-      failed: deviceFlags.filter((flag) => !flag).length,
-      rate: qualifyRate(deviceFlags)
+      total: buckets.total,
+      failed: buckets.failed,
+      pending: buckets.pending,
+      rate: buckets.rate
     }
   })
 
   return { overall, byBuilding, byDevice }
 })
 
-/** 未生成整改建议的不合格测点（判定台一键生成入口） */
+/** 未生成整改建议的不合格测点（判定台一键生成入口；待判定点不计入） */
 export const unhandledUnqualified = derived([verdictRows, rectifyList], ([$rows, $rectifies]) =>
-  $rows.filter((row) => !row.qualified && !$rectifies.some((rectify) => rectify.pointId === row.point.id))
+  $rows.filter((row) => row.qualified === false && !$rectifies.some((rectify) => rectify.pointId === row.point.id))
 )
 
 /** 按筛选条件过滤后的整改单 */
@@ -156,17 +187,23 @@ export async function autoJudgePoint(pointId: string, inspector = ''): Promise<V
   if (!point) return null
   const device = get(deviceList).find((item) => item.id === point.deviceId)
   const building = device ? get(buildingList).find((item) => item.id === device.buildingId) : undefined
-  const result = judgePoint(point.measuredOhm, point.limitOhm)
+  const evaluation = evaluatePoint(point)
   const existing = get(verdictList).find((item) => item.pointId === pointId)
   const now = Date.now()
   const row: Verdict = {
     id: existing?.id ?? `vrd_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
     pointId,
-    result,
-    basis: existing?.basis || defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm),
+    result: evaluation.result,
+    basis: buildBasisWithSeason(
+      building?.protectionClass ?? '三类',
+      device?.type ?? '接地体',
+      point.limitOhm,
+      evaluation
+    ),
     inspector: inspector || existing?.inspector || '',
     verdictDate: point.measureDate,
     confirmed: false,
+    ...seasonSnapshot(evaluation),
     createdAt: existing?.createdAt ?? now,
     updatedAt: now
   }
@@ -188,12 +225,27 @@ export async function confirmVerdict(id: string, patch: Partial<Verdict> = {}): 
   await db.verdicts.update(id, { ...patch, confirmed: true, updatedAt: Date.now() } as never)
 }
 
-/** 批量改判定结论（判定台批量操作） */
-export async function bulkSetVerdictResult(pointIds: string[], result: VerdictResult, inspector: string): Promise<number> {
+/**
+ * 批量改判定结论（判定台批量操作）。
+ * 月份或季节系数缺失的测点不给合格 / 不合格结论：整批改判时跳过这些测点，
+ * 由页面提示先补录检测日期或现场季节系数。
+ */
+export async function bulkSetVerdictResult(
+  pointIds: string[],
+  result: VerdictResult,
+  inspector: string
+): Promise<{ updated: number; skipped: string[] }> {
   const now = Date.now()
+  const skipped: string[] = []
   for (const pointId of pointIds) {
     const point = get(pointList).find((item) => item.id === pointId)
     if (!point) continue
+    const evaluation = evaluatePoint(point)
+    // 缺月份 / 系数的记录不允许人工强判合格或不合格
+    if (evaluation.result === '待判定') {
+      skipped.push(point.code)
+      continue
+    }
     const device = get(deviceList).find((item) => item.id === point.deviceId)
     const building = device ? get(buildingList).find((item) => item.id === device.buildingId) : undefined
     const existing = get(verdictList).find((item) => item.pointId === pointId)
@@ -201,16 +253,19 @@ export async function bulkSetVerdictResult(pointIds: string[], result: VerdictRe
       id: existing?.id ?? `vrd_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
       pointId,
       result,
-      basis: existing?.basis || defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm),
+      basis:
+        existing?.basis ||
+        buildBasisWithSeason(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm, evaluation),
       inspector,
       verdictDate: existing?.verdictDate ?? point.measureDate,
       confirmed: true,
+      ...seasonSnapshot(evaluation),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now
     }
     await db.verdicts.put(row)
   }
-  return pointIds.length
+  return { updated: pointIds.length - skipped.length, skipped }
 }
 
 export async function removeVerdict(id: string): Promise<void> {
@@ -227,7 +282,7 @@ export async function generateRectifies(options: {
 } = {}): Promise<number> {
   const owner = options.owner ?? '王振海'
   const inspector = options.inspector ?? '陈立群'
-  const rows = get(verdictRows).filter((row) => !row.qualified)
+  const rows = get(verdictRows).filter((row) => row.qualified === false)
   const existingPointIds = new Set(get(rectifyList).map((rectify) => rectify.pointId))
   const now = Date.now()
   let created = 0
@@ -236,11 +291,17 @@ export async function generateRectifies(options: {
     if (existingPointIds.has(row.point.id)) return
     const template = SUGGESTION_TEMPLATES[index % SUGGESTION_TEMPLATES.length]
     const deadline = new Date(now + template.days * 86400000).toISOString().slice(0, 10)
+    const estimateText =
+      row.season.estimatedOhm !== null
+        ? `原始实测 ${row.point.measuredOhm} Ω × ${
+            row.season.factor !== null ? row.season.factor.toFixed(2) : '—'
+          }（${row.season.factorSource ?? ''}）＝ 最不利季节估算 ${row.season.estimatedOhm} Ω，限值 ${row.point.limitOhm} Ω`
+        : `实测 ${row.point.measuredOhm} Ω，限值 ${row.point.limitOhm} Ω`
     records.push({
       id: `rct_${now.toString(36)}${index}${Math.random().toString(36).slice(2, 6)}`,
       buildingId: row.building?.id ?? row.device?.buildingId ?? '',
       pointId: row.point.id,
-      problem: `${template.problem}：${row.point.code} 实测 ${row.point.measuredOhm} Ω，限值 ${row.point.limitOhm} Ω`,
+      problem: `${template.problem}：${row.point.code} ${estimateText}`,
       suggestion: template.suggestion,
       deadline,
       state: '待整改',

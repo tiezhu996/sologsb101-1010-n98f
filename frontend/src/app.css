@@ -314,6 +314,22 @@ body {
   border-left-color: var(--color-ok);
 }
 
+.gb-card.is-pending {
+  border-left-color: #d68910;
+}
+
+/* 待判定（缺检测月份 / 季节系数）提示 */
+.gb-warn {
+  color: #9a6a00;
+  font-weight: 600;
+}
+
+.gb-alert--warn {
+  border-color: #d8a94b;
+  background: #fdf4e3;
+  color: #7a5700;
+}
+
 @media (max-width: 900px) {
   .gb-panel {
     padding: 12px;

@@ -93,14 +93,17 @@
         return true
       })
       .sort((a, b) => {
-        if (a.qualified === b.qualified) return a.point.code.localeCompare(b.point.code, 'zh-Hans-CN')
-        return a.qualified ? 1 : -1
+        // 不合格在前、待判定居中、合格在后；同档按测点编号
+        const rank = (qualified: boolean | null): number => (qualified === false ? 0 : qualified === null ? 1 : 2)
+        if (rank(a.qualified) !== rank(b.qualified)) return rank(a.qualified) - rank(b.qualified)
+        return a.point.code.localeCompare(b.point.code, 'zh-Hans-CN')
       })
   )
 
   const totals = $derived({
     points: rows.length,
-    unqualified: rows.filter((row) => !row.qualified).length,
+    unqualified: rows.filter((row) => row.qualified === false).length,
+    pending: rows.filter((row) => row.qualified === null).length,
     unconfirmed: rows.filter((row) => !row.verdict?.confirmed).length,
     inconsistent: rows.filter((row) => row.verdict && !row.consistent).length
   })
@@ -128,15 +131,26 @@
 
   async function runAutoJudgeAll(): Promise<void> {
     const count = await autoJudgeAll(inspector)
-    notice = `已对 ${count} 个测点完成自动初判，请逐条由检测人确认生效。`
+    const pendingCount = $verdictRows.filter((row) => row.qualified === null).length
+    notice =
+      `已按季节修正后的最不利季节估算值对 ${count} 个测点完成自动初判，请逐条由检测人确认生效。` +
+      (pendingCount > 0 ? `其中 ${pendingCount} 个测点缺检测月份或季节系数，标记为待判定，请补录后再判。` : '')
   }
 
   async function runAutoJudge(pointId: string): Promise<void> {
+    const target = $verdictRows.find((row) => row.point.id === pointId)
     await autoJudgePoint(pointId, inspector)
-    notice = '已按实测值与限值比对给出初判，请确认生效。'
+    notice =
+      target?.qualified === null
+        ? '该测点缺检测月份或季节系数，已标记为「待判定」，请补录检测日期或现场系数后再判。'
+        : '已按季节修正估算值与限值比对给出初判，请确认生效。'
   }
 
   async function confirmOne(row: (typeof rows)[number]): Promise<void> {
+    if (row.qualified === null) {
+      notice = `${row.point.code} 缺检测月份或季节系数，季节修正无法折算，暂不给合格结论，请先到测点录入页补录。`
+      return
+    }
     if (!row.verdict) {
       await autoJudgePoint(row.point.id, inspector)
       const latest = $verdictRows.find((item) => item.point.id === row.point.id)
@@ -153,8 +167,14 @@
       notice = '请先勾选要批量改判的测点。'
       return
     }
-    const count = await bulkSetVerdictResult(selected, result, bulkInspector)
-    notice = `已批量将 ${count} 个测点的判定结论改为「${result}」并确认生效。`
+    const out = await bulkSetVerdictResult(selected, result, bulkInspector)
+    if (out.skipped.length > 0) {
+      notice =
+        `已改判 ${out.updated} 个测点；${out.skipped.length} 个测点（${out.skipped.join('、')}）` +
+        '缺检测月份或季节系数，按规定不给合格 / 不合格结论，已跳过，请先补录。'
+    } else {
+      notice = `已批量将 ${out.updated} 个测点的判定结论改为「${result}」并确认生效。`
+    }
     selected = []
   }
 
@@ -277,7 +297,7 @@
     <div>
       <h2 class="page__title">合格判定与整改建议</h2>
       <p class="gb-hint">
-        实测值与限值比对自动给出初判，检测人确认后生效；不合格测点可一键批量生成整改建议，并跟踪整改状态机到复检闭环。
+        实测值先按季节系数折算为最不利季节估算值，再与限值比对自动初判（现场量了当次系数以现场为准，否则按检测月份查月份表；月份或系数缺失判「待判定」）；检测人确认后生效，不合格测点可生成整改建议并跟踪到复检闭环。
       </p>
     </div>
     <div class="page__actions">
@@ -297,15 +317,21 @@
   {/if}
 
   <div class="gb-stats-row">
-    <StatBadge label="待判定测点" value={totals.points} suffix="点" tone="primary" />
+    <StatBadge label="测点合计" value={totals.points} suffix="点" tone="primary" />
     <StatBadge
-      label="不合格"
+      label="不合格（估算口径）"
       value={totals.unqualified}
       suffix="点"
       tone={totals.unqualified > 0 ? 'danger' : 'success'}
     />
+    <StatBadge
+      label="待判定（缺月份/系数）"
+      value={totals.pending}
+      suffix="点"
+      tone={totals.pending > 0 ? 'warning' : 'success'}
+    />
     <StatBadge label="未确认" value={totals.unconfirmed} suffix="条" tone={totals.unconfirmed > 0 ? 'warning' : 'success'} />
-    <StatBadge label="整体合格率" value={$qualifyStats.overall.rate} percent={$qualifyStats.overall.rate} tone="success" />
+    <StatBadge label="整体合格率（估算）" value={$qualifyStats.overall.rate} percent={$qualifyStats.overall.rate} tone="success" />
     <StatBadge label="初判不一致" value={totals.inconsistent} suffix="条" tone={totals.inconsistent > 0 ? 'warning' : 'default'} />
   </div>
 
@@ -360,7 +386,9 @@
             </th>
             <th>测点</th>
             <th>建筑物 / 装置</th>
-            <th class="is-num">实测（Ω）</th>
+            <th class="is-num">原始实测（Ω）</th>
+            <th class="is-num">季节系数</th>
+            <th class="is-num">最不利估算（Ω）</th>
             <th class="is-num">限值（Ω）</th>
             <th>自动初判</th>
             <th>检测人结论</th>
@@ -370,7 +398,7 @@
         </thead>
         <tbody>
           {#each rows as row (row.point.id)}
-            <tr class:is-bad={!row.qualified}>
+            <tr class:is-bad={row.qualified === false} class:is-pending={row.qualified === null}>
               <td class="is-check">
                 <input type="checkbox" checked={selected.includes(row.point.id)} onchange={() => toggleSelect(row.point.id)} />
               </td>
@@ -380,9 +408,18 @@
               </td>
               <td>
                 <div>{row.building?.name ?? '未知建筑物'}</div>
-                <div class="gb-hint">{row.device?.type ?? '未知装置'} · {row.point.measureDate}</div>
+                <div class="gb-hint">{row.device?.type ?? '未知装置'} · {row.point.measureDate || '缺检测日期'}</div>
               </td>
               <td class="is-num gb-mono">{row.point.measuredOhm}</td>
+              <td class="is-num gb-mono">
+                {#if row.season.factor !== null}
+                  {row.season.factor.toFixed(2)}
+                  <div class="gb-hint">{row.season.factorSource}</div>
+                {:else}
+                  <span class="gb-warn">缺</span>
+                {/if}
+              </td>
+              <td class="is-num gb-mono">{row.season.estimatedOhm ?? '—'}</td>
               <td class="is-num gb-mono">{row.point.limitOhm}</td>
               <td><QualifyTag result={row.autoResult} size="small" plain /></td>
               <td>
@@ -391,17 +428,25 @@
                   <div class="gb-hint">
                     {row.verdict.confirmed ? '已确认生效' : '待检测人确认'} · {row.verdict.inspector || '未署名'}
                   </div>
-                  {#if !row.consistent}
+                  {#if row.qualified === null}
+                    <div class="gb-warn">{row.season.missingReason ?? '缺月份 / 系数'}，请补录后再判</div>
+                  {:else if !row.consistent}
                     <div class="gb-danger">与初判不一致</div>
                   {/if}
                 {:else}
                   <span class="gb-hint">尚未判定</span>
                 {/if}
               </td>
-              <td class="gb-hint">{row.verdict?.basis ?? '—'}</td>
+              <td class="gb-hint basis-cell">{row.verdict?.basis ?? '—'}</td>
               <td class="row-actions">
                 <button class="btn btn--small" type="button" onclick={() => runAutoJudge(row.point.id)}>初判</button>
-                <button class="btn btn--primary btn--small" type="button" onclick={() => confirmOne(row)}>
+                <button
+                  class="btn btn--primary btn--small"
+                  type="button"
+                  disabled={row.qualified === null}
+                  title={row.qualified === null ? '缺月份 / 季节系数，补录后才能确认' : ''}
+                  onclick={() => confirmOne(row)}
+                >
                   {row.verdict?.confirmed ? '重新确认' : '确认生效'}
                 </button>
               </td>
@@ -599,6 +644,19 @@
 
   tr.is-bad td {
     background: #fff6f4;
+  }
+
+  tr.is-pending td {
+    background: #fdf8ee;
+  }
+
+  .gb-warn {
+    color: #9a6a00;
+    font-weight: 600;
+  }
+
+  .basis-cell {
+    max-width: 320px;
   }
 
   .template-row {

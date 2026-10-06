@@ -26,7 +26,8 @@
   import type { Point, PointPasteRow } from '$lib/types/point.ts'
   import { DEVICE_TYPES } from '$lib/types/device.ts'
   import type { DeviceType } from '$lib/types/device.ts'
-  import { isQualified, limitRatio, qualifyRate, suggestLimitOhm } from '$lib/utils/resistance.ts'
+  import { judgeBuckets, limitRatio, suggestLimitOhm } from '$lib/utils/resistance.ts'
+  import { MONTH_SEASON_FACTORS, monthFromMeasureDate, seasonFactorByMonth } from '$lib/utils/season.ts'
   import { readQuery, writeQuery } from '$lib/utils/query.ts'
   import { useRouter } from '$lib/utils/router.ts'
 
@@ -39,6 +40,8 @@
     limitOhm: number
     meter: string
     measureDate: string
+    /** 现场实测的当次季节系数；空字符串表示未现场测定（回退月份表） */
+    siteSeasonFactor: string
   }
 
   const query = readQuery()
@@ -64,7 +67,8 @@
     measuredOhm: 0,
     limitOhm: 10,
     meter: '',
-    measureDate: new Date().toISOString().slice(0, 10)
+    measureDate: new Date().toISOString().slice(0, 10),
+    siteSeasonFactor: ''
   })
 
   const deviceOptions = $derived(
@@ -94,11 +98,15 @@
     })
   )
 
-  const totals = $derived({
-    points: rows.length,
-    unqualified: rows.filter((row) => !row.qualified).length,
-    rate: qualifyRate(rows.map((row) => row.qualified)),
-    activeDevicePoints: $activeDeviceId ? pointsOfDevice($activeDeviceId).length : $pointList.length
+  const totals = $derived.by(() => {
+    const buckets = judgeBuckets(rows.map((row) => row.result))
+    return {
+      points: buckets.total,
+      unqualified: buckets.failed,
+      pending: buckets.pending,
+      rate: buckets.rate,
+      activeDevicePoints: $activeDeviceId ? pointsOfDevice($activeDeviceId).length : $pointList.length
+    }
   })
 
   const activeDevice = $derived(
@@ -108,6 +116,33 @@
   const defaultLimit = $derived(
     activeDevice ? suggestLimitOhm(activeBuilding?.protectionClass ?? '三类', activeDevice.type) : 10
   )
+
+  /** 表单实时季节修正预览：现场系数优先，否则月份表，两者都缺提示待判定 */
+  const formSeason = $derived.by(() => {
+    const site = form.siteSeasonFactor.trim()
+    const siteValue = site.length > 0 ? Number(site) : null
+    const month = monthFromMeasureDate(form.measureDate)
+    if (siteValue !== null && Number.isFinite(siteValue) && siteValue > 0) {
+      return {
+        source: '现场实测' as const,
+        factor: siteValue,
+        month,
+        estimated: Number((Number(form.measuredOhm) * siteValue).toFixed(3)),
+        missing: null as string | null
+      }
+    }
+    const tableFactor = seasonFactorByMonth(month)
+    if (tableFactor !== null) {
+      return {
+        source: '月份表' as const,
+        factor: tableFactor,
+        month,
+        estimated: Number((Number(form.measuredOhm) * tableFactor).toFixed(3)),
+        missing: null as string | null
+      }
+    }
+    return { source: null, factor: null, month, estimated: null, missing: month === null ? '检测月份缺失' : `${month} 月季节系数缺失` }
+  })
 
   function openCreate(): void {
     if (!$activeDeviceId) {
@@ -124,7 +159,8 @@
       measuredOhm: 0,
       limitOhm: defaultLimit,
       meter: existing[0]?.meter ?? '',
-      measureDate: existing[0]?.measureDate ?? new Date().toISOString().slice(0, 10)
+      measureDate: existing[0]?.measureDate ?? new Date().toISOString().slice(0, 10),
+      siteSeasonFactor: ''
     }
     showDialog = true
   }
@@ -138,7 +174,8 @@
       measuredOhm: point.measuredOhm,
       limitOhm: point.limitOhm,
       meter: point.meter,
-      measureDate: point.measureDate
+      measureDate: point.measureDate,
+      siteSeasonFactor: point.siteSeasonFactor !== null ? String(point.siteSeasonFactor) : ''
     }
     showDialog = true
   }
@@ -156,13 +193,24 @@
       formError = '限值应为大于 0 的数字（Ω）'
       return
     }
+    let siteSeasonFactor: number | null = null
+    const factorText = form.siteSeasonFactor.trim()
+    if (factorText.length > 0) {
+      const factorValue = Number(factorText)
+      if (!Number.isFinite(factorValue) || factorValue <= 0) {
+        formError = '现场季节系数应为大于 0 的数字；留空则按检测月份查月份表'
+        return
+      }
+      siteSeasonFactor = Number(factorValue.toFixed(3))
+    }
     const payload = {
       code: form.code.trim(),
       location: form.location.trim(),
       measuredOhm: Number(form.measuredOhm),
       limitOhm: Number(form.limitOhm),
       meter: form.meter.trim(),
-      measureDate: form.measureDate
+      measureDate: form.measureDate,
+      siteSeasonFactor
     }
     if (editingId) {
       await updatePoint(editingId, payload)
@@ -249,7 +297,7 @@
     <div>
       <h2 class="page__title">接地电阻测点录入</h2>
       <p class="gb-hint">
-        按装置逐点录入实测电阻与限值，可批量粘贴整段手记数据；实测值 ≤ 限值判合格，超限会即时标红。
+        按装置逐点录入实测电阻与限值，可批量粘贴整段手记数据。实测值先按季节系数折算最不利季节估算值，再与限值比对：现场量了当次系数以现场为准，否则按检测月份查月份表；月份或系数缺失的测点标「待判定」，不给合格结论。
       </p>
       {#if activeDevice}
         <p class="gb-hint">
@@ -279,12 +327,18 @@
   <div class="gb-stats-row">
     <StatBadge label="当前测点" value={totals.points} suffix="点" tone="primary" />
     <StatBadge
-      label="不合格"
+      label="不合格（按估算值）"
       value={totals.unqualified}
       suffix="点"
       tone={totals.unqualified > 0 ? 'danger' : 'success'}
     />
-    <StatBadge label="合格率" value={totals.rate} percent={totals.rate} tone="success" />
+    <StatBadge
+      label="待判定（缺月份/系数）"
+      value={totals.pending}
+      suffix="点"
+      tone={totals.pending > 0 ? 'warning' : 'success'}
+    />
+    <StatBadge label="合格率（估算口径）" value={totals.rate} percent={totals.rate} tone="success" />
     <StatBadge label="选中装置测点" value={totals.activeDevicePoints} suffix="点" tone="info" />
   </div>
 
@@ -322,7 +376,9 @@
             <th>测点编号</th>
             <th>位置</th>
             <th>所属装置</th>
-            <th class="is-num">实测（Ω）</th>
+            <th class="is-num">原始实测（Ω）</th>
+            <th class="is-num">季节系数</th>
+            <th class="is-num">最不利估算（Ω）</th>
             <th class="is-num">限值（Ω）</th>
             <th class="is-num">占限值</th>
             <th>判定</th>
@@ -333,7 +389,7 @@
         </thead>
         <tbody>
           {#each rows as row (row.point.id)}
-            <tr class:is-bad={!row.qualified}>
+            <tr class:is-bad={row.qualified === false} class:is-pending={row.qualified === null}>
               <td class="gb-mono">{row.point.code}</td>
               <td>{row.point.location}</td>
               <td>
@@ -341,18 +397,38 @@
                 <span class="gb-hint"> {buildingById(row.device?.buildingId)?.name ?? ''}</span>
               </td>
               <td class="is-num gb-mono">{row.point.measuredOhm}</td>
+              <td class="is-num gb-mono">
+                {#if row.season.factor !== null}
+                  {row.season.factor.toFixed(2)}
+                  <div class="gb-hint">{row.season.factorSource}</div>
+                {:else}
+                  <span class="gb-warn">缺</span>
+                {/if}
+              </td>
+              <td class="is-num gb-mono">{row.estimatedOhm ?? '—'}</td>
               <td class="is-num gb-mono">{row.point.limitOhm}</td>
-              <td class="is-num gb-mono">{limitRatio(row.point.measuredOhm, row.point.limitOhm)}</td>
+              <td class="is-num gb-mono">
+                {row.estimatedOhm !== null ? limitRatio(row.estimatedOhm, row.point.limitOhm) : '—'}
+              </td>
               <td>
-                <QualifyTag measuredOhm={row.point.measuredOhm} limitOhm={row.point.limitOhm} size="small" />
-                {#if !isQualified(row.point.measuredOhm, row.point.limitOhm)}
+                <QualifyTag
+                  measuredOhm={row.point.measuredOhm}
+                  limitOhm={row.point.limitOhm}
+                  season={row.season}
+                  size="small"
+                />
+                {#if row.qualified === false}
                   <span class="gb-danger">
-                    超限 {((limitRatio(row.point.measuredOhm, row.point.limitOhm) - 1) * 100).toFixed(1)}%
+                    估算超限 {((limitRatio(row.estimatedOhm ?? row.point.measuredOhm, row.point.limitOhm) - 1) * 100).toFixed(1)}%
                   </span>
+                {:else if row.qualified === null}
+                  <span class="gb-warn">{row.season.missingReason ?? '待判定'}，请补录</span>
                 {/if}
               </td>
               <td class="gb-hint">{row.point.meter}</td>
-              <td class="gb-mono">{row.point.measureDate}</td>
+              <td class="gb-mono">
+                {#if row.point.measureDate}{row.point.measureDate}{:else}<span class="gb-warn">缺月份</span>{/if}
+              </td>
               <td class="row-actions">
                 <button class="btn btn--small" type="button" onclick={() => openEdit(row.point)}>编辑</button>
                 <button class="btn btn--danger btn--small" type="button" onclick={() => confirmRemove(row.point)}>
@@ -412,10 +488,50 @@
             <input bind:value={form.meter} placeholder="如 ZC-8 接地电阻测试仪 / No.20230517" maxlength="60" />
           </label>
           <label class="gb-field">
-            <span>检测日期</span>
+            <span>检测日期 *</span>
             <input type="date" bind:value={form.measureDate} />
           </label>
+          <label class="gb-field">
+            <span>现场实测当次季节系数（留空按月份表）</span>
+            <input type="number" min="0.1" step="0.01" bind:value={form.siteSeasonFactor} placeholder="如现场量得 1.24" />
+          </label>
         </div>
+        <div class="season-preview" class:is-missing={formSeason.missing !== null}>
+          {#if formSeason.missing}
+            <span class="gb-warn">
+              ⚠ {formSeason.missing}，且未填写现场季节系数：该测点将标记为「待判定」，不出具合格结论，请补录检测日期或现场系数。
+            </span>
+          {:else}
+            <span>
+              季节修正预览：原始实测 {Number(form.measuredOhm) || 0} Ω × {formSeason.factor?.toFixed(2)}（{formSeason.source}
+              {formSeason.month !== null ? `· ${formSeason.month} 月` : ''}）＝ 最不利季节估算
+              <b>{formSeason.estimated} Ω</b>
+              {#if Number.isFinite(Number(form.limitOhm)) && Number(form.limitOhm) > 0}
+                → {(formSeason.estimated ?? 0) <= Number(form.limitOhm) ? '估算值不超限，倾向合格' : '估算值已超限，倾向不合格'}
+                （限值 {Number(form.limitOhm)} Ω）
+              {/if}
+            </span>
+          {/if}
+        </div>
+        <details class="season-table-hint">
+          <summary>月份季节系数参考表（现场未测定时兜底，正式报告以现场 / 当地规范为准）</summary>
+          <table class="gb-table">
+            <thead>
+              <tr>
+                {#each Array.from({ length: 12 }, (_, i) => i + 1) as month (month)}
+                  <th class="is-num">{month} 月</th>
+                {/each}
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                {#each Array.from({ length: 12 }, (_, i) => i + 1) as month (month)}
+                  <td class="is-num gb-mono">{MONTH_SEASON_FACTORS[month].toFixed(2)}</td>
+                {/each}
+              </tr>
+            </tbody>
+          </table>
+        </details>
       </div>
       <div class="gb-modal__foot">
         <button class="btn" type="button" onclick={() => (showDialog = false)}>取消</button>
@@ -532,6 +648,35 @@
 
   tr.is-bad td {
     background: #fff6f4;
+  }
+
+  tr.is-pending td {
+    background: #fdf8ee;
+  }
+
+  .gb-warn {
+    color: #9a6a00;
+    font-weight: 600;
+  }
+
+  .season-preview {
+    margin: 8px 0;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: #f3f7fb;
+    border: 1px dashed #9db4c8;
+    font-size: 13px;
+    color: #33505f;
+  }
+
+  .season-preview.is-missing {
+    background: #fdf4e3;
+    border-color: #d8a94b;
+  }
+
+  .season-table-hint {
+    font-size: 12px;
+    color: #6b7d8b;
   }
 
   .errors {

@@ -15,6 +15,12 @@ export interface Point {
   meter: string
   /** 检测日期 */
   measureDate: string
+  /**
+   * 现场实测的当次季节系数（可选）。
+   * 现场量了就以现场为准；留空则按检测月份查月份季节系数表，
+   * 月份也缺失时测点标记为「待判定」，不给合格结论。
+   */
+  siteSeasonFactor: number | null
   createdAt: number
   updatedAt: number
 }
@@ -27,6 +33,7 @@ export interface PointDraft {
   limitOhm: number
   meter: string
   measureDate: string
+  siteSeasonFactor: number | null
 }
 
 export function createEmptyPointDraft(limitOhm = 10, meter = '', measureDate = ''): PointDraft {
@@ -36,7 +43,8 @@ export function createEmptyPointDraft(limitOhm = 10, meter = '', measureDate = '
     measuredOhm: 0,
     limitOhm,
     meter,
-    measureDate: measureDate || new Date().toISOString().slice(0, 10)
+    measureDate: measureDate || new Date().toISOString().slice(0, 10),
+    siteSeasonFactor: null
   }
 }
 

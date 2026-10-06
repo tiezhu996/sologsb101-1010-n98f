@@ -2,19 +2,25 @@
   /**
    * <QualifyTag> 按合格 / 不合格 / 待判定渲染底色与图标。
    * 被测点录入页（/points）与合格判定页（/verdicts）消费。
+   *
+   * 判定口径：传入 season（季节修正评价）时，以最不利季节估算值为准，
+   * 月份 / 系数缺失展示「待判定」；未传 season 时回退到实测值与限值直接比对。
    */
-  import { isQualified, limitRatio } from '$lib/utils/resistance.ts'
+  import { limitRatio } from '$lib/utils/resistance.ts'
   import type { VerdictResult } from '$lib/types/verdict.ts'
+  import type { PointSeasonEvaluation } from '$lib/utils/season.ts'
 
   type ToneKey = VerdictResult
 
   let {
     /** 合格 / 不合格 / 待判定 */
     result = '待判定',
-    /** 实测电阻（Ω），传入后展示数值与超限幅度 */
+    /** 原始实测电阻（Ω），报告与提示中保留 */
     measuredOhm = null,
     /** 限值（Ω） */
     limitOhm = null,
+    /** 季节修正评价：含最不利季节估算值、系数与来源 */
+    season = null,
     /** 尺寸 */
     size = 'default',
     /** 是否以浅色描边风格展示 */
@@ -23,6 +29,7 @@
     result?: VerdictResult
     measuredOhm?: number | null
     limitOhm?: number | null
+    season?: PointSeasonEvaluation | null
     size?: 'default' | 'small' | 'large'
     plain?: boolean
   } = $props()
@@ -33,22 +40,35 @@
     待判定: { color: '#8c8479', bg: '#f2f2f2', icon: '?' }
   }
 
-  // 传入了实测值与限值就按限值现算，否则用传入的结论
-  const resolvedResult = $derived<VerdictResult>(
-    measuredOhm !== null && limitOhm !== null && limitOhm > 0
-      ? isQualified(measuredOhm, limitOhm)
-        ? '合格'
-        : '不合格'
-      : result
+  // 传了季节评价就按最不利季节估算值判定；否则回退实测值直接比对
+  const resolvedResult = $derived.by<VerdictResult>(() => {
+    if (season) return season.result
+    if (measuredOhm !== null && limitOhm !== null && limitOhm > 0) {
+      return measuredOhm <= limitOhm ? '合格' : '不合格'
+    }
+    return result
+  })
+  /** 用于标签数值与余量提示的对比值：优先季节估算值 */
+  const compareOhm = $derived<number | null>(
+    season ? season.estimatedOhm : measuredOhm
   )
   const tone = $derived(TONE[resolvedResult] ?? TONE.待判定)
-  const ratio = $derived(measuredOhm !== null && limitOhm ? limitRatio(measuredOhm, limitOhm) : 0)
-  const valueText = $derived(measuredOhm === null ? '' : `${measuredOhm} Ω`)
-  const tip = $derived(
-    measuredOhm === null || limitOhm === null
-      ? `${resolvedResult}`
-      : `${resolvedResult}：实测 ${measuredOhm} Ω / 限值 ${limitOhm} Ω（${ratio > 1 ? `超限 ${((ratio - 1) * 100).toFixed(1)}%` : `余量 ${(limitOhm - measuredOhm).toFixed(2)} Ω`}）`
-  )
+  const ratio = $derived(compareOhm !== null && limitOhm ? limitRatio(compareOhm, limitOhm) : 0)
+  const valueText = $derived(compareOhm === null ? '' : `${compareOhm} Ω`)
+  const tip = $derived.by(() => {
+    if (season) {
+      if (season.result === '待判定') return season.note
+      const ratioText =
+        ratio > 1 ? `超限 ${((ratio - 1) * 100).toFixed(1)}%` : `余量 ${(limitOhm! - compareOhm!).toFixed(2)} Ω`
+      return `${season.result}：原始实测 ${measuredOhm ?? '—'} Ω × ${season.factor?.toFixed(2) ?? '—'}（${
+        season.factorSource ?? ''
+      }）＝ 估算 ${season.estimatedOhm} Ω / 限值 ${limitOhm} Ω（${ratioText}）`
+    }
+    if (measuredOhm === null || limitOhm === null) return `${resolvedResult}`
+    return `${resolvedResult}：实测 ${measuredOhm} Ω / 限值 ${limitOhm} Ω（${
+      ratio > 1 ? `超限 ${((ratio - 1) * 100).toFixed(1)}%` : `余量 ${(limitOhm - measuredOhm).toFixed(2)} Ω`
+    }）`
+  })
   const style = $derived(
     plain
       ? `color:${tone.color};background:${tone.bg};border-color:${tone.color};`

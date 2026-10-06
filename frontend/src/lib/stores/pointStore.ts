@@ -10,7 +10,8 @@ import { db, watchTable } from '$lib/utils/db'
 import type { Point, PointDraft } from '$lib/types/point'
 import { createEmptyPointDraft } from '$lib/types/point'
 import { deviceList } from '$lib/stores/buildingStore'
-import { isQualified, limitRatio } from '$lib/utils/resistance'
+import { limitRatio } from '$lib/utils/resistance'
+import { evaluateSeasonPoint, type SeasonJudgeResult } from '$lib/utils/season'
 
 /** 响应式测点集合 */
 export const pointList = writable<Point[]>([])
@@ -43,17 +44,29 @@ export const activePoints = derived([pointList, activeDeviceId], ([$points, $dev
     .sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
 })
 
-/** 测点行：附带装置类型与合格标记，供测点录入页表格展示 */
+/** 测点行：附带装置类型、季节修正估算值与三态判定，供测点录入页表格展示 */
 export const pointRows = derived([pointList, deviceList], ([$points, $devices]) =>
   $points
     .map((point) => {
       const device = $devices.find((item) => item.id === point.deviceId)
+      const season = evaluateSeasonPoint({
+        measuredOhm: point.measuredOhm,
+        limitOhm: point.limitOhm,
+        measureDate: point.measureDate,
+        siteSeasonFactor: point.siteSeasonFactor
+      })
+      const estimateForRatio = season.estimatedOhm ?? point.measuredOhm
       return {
         point,
         device,
         deviceType: device?.type ?? '未知装置',
-        qualified: isQualified(point.measuredOhm, point.limitOhm),
-        ratio: limitRatio(point.measuredOhm, point.limitOhm)
+        season,
+        /** 三态结论：合格 / 不合格 / 待判定（月份或系数缺失） */
+        result: season.result as SeasonJudgeResult,
+        /** 以最不利季节估算值为准；待判定（null）既不计合格也不计不合格 */
+        qualified: season.result === '合格' ? true : season.result === '不合格' ? false : null,
+        estimatedOhm: season.estimatedOhm,
+        ratio: limitRatio(estimateForRatio, point.limitOhm)
       }
     })
     .sort((a, b) => b.ratio - a.ratio)
@@ -126,6 +139,8 @@ export async function importPointRows(
     limitOhm: row.limitOhm,
     meter: meta.meter,
     measureDate: meta.measureDate,
+    // 批量粘贴不携带现场系数，按检测月份回退月份季节系数表
+    siteSeasonFactor: null,
     createdAt: now + index,
     updatedAt: now + index
   }))

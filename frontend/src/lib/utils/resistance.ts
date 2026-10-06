@@ -1,9 +1,13 @@
 /**
  * 接地电阻工具：限值比对、合格率计算、Ω 与 kΩ 单位换算。
  * 页面、store 与数据库播种共用同一套算法，保证展示值与存储判定一致。
+ *
+ * 注意：合格判定一律以季节修正后的最不利季节估算值为准，本文件只做纯数值运算；
+ * 季节系数解析、估算值折算与三态结论见 utils/season.ts。
  */
 import type { ProtectionClass } from '$lib/types/building'
 import type { DeviceType } from '$lib/types/device'
+import type { SeasonJudgeResult } from '$lib/utils/season'
 
 /** 保留小数位 */
 export function round(value: number, digits = 3): number {
@@ -61,6 +65,23 @@ export function qualifyBuckets(flags: boolean[]): { total: number; passed: numbe
 }
 
 /**
+ * 三态分档统计：合格 / 不合格 / 待判定（月份或季节系数缺失时不下结论）。
+ * 合格率只统计已给出合格结论的测点，分母含待判定点，避免缺数据被当成 100% 合格。
+ */
+export function judgeBuckets(results: SeasonJudgeResult[]): {
+  total: number
+  passed: number
+  failed: number
+  pending: number
+  rate: number
+} {
+  const total = results.length
+  const passed = results.filter((result) => result === '合格').length
+  const failed = results.filter((result) => result === '不合格').length
+  return { total, passed, failed, pending: total - passed - failed, rate: total === 0 ? 0 : round((passed / total) * 100, 1) }
+}
+
+/**
  * 建议限值：按防雷类别与装置类型给出初始限值（Ω）。
  * 一类建筑独立接地装置取 10 Ω、共用接地取 4 Ω；仅为录入初值，最终以设计文件为准。
  */
@@ -68,9 +89,4 @@ export function suggestLimitOhm(protectionClass: ProtectionClass, deviceType: De
   if (protectionClass === '一类') return deviceType === '接地体' ? 4 : 10
   if (protectionClass === '二类') return deviceType === '接地体' ? 4 : 10
   return 10
-}
-
-/** 电阻温度/土壤修正的简易提示：季节系数修正后的估算值 */
-export function seasonCorrected(measuredOhm: number, seasonFactor = 1.2): number {
-  return round(measuredOhm * seasonFactor, 3)
 }

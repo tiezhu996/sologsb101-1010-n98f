@@ -26,6 +26,7 @@
   import { DEVICE_MATERIALS, DEVICE_TYPES } from '$lib/types/device.ts'
   import type { Device, DeviceType } from '$lib/types/device.ts'
   import { suggestLimitOhm } from '$lib/utils/resistance.ts'
+  import { evaluateSeasonPoint } from '$lib/utils/season.ts'
   import { readQuery, writeQuery } from '$lib/utils/query.ts'
   import { useRouter } from '$lib/utils/router.ts'
 
@@ -71,7 +72,7 @@
     $filteredDevices
       .map((device) => {
         const building = buildingById(device.buildingId)
-        const stats = $pointStatsByDevice[device.id] ?? { count: 0, unqualified: 0, minOhm: 0, maxOhm: 0 }
+        const stats = $pointStatsByDevice[device.id] ?? { count: 0, unqualified: 0, pending: 0, minOhm: 0, maxOhm: 0 }
         return { device, building, stats, expanded: expandedDeviceId === device.id }
       })
       .filter((row) => !$deviceFilter.onlyWithoutPoint || row.stats.count === 0)
@@ -82,7 +83,8 @@
     devices: rows.length,
     quantity: rows.reduce((sum, row) => sum + row.device.quantity, 0),
     points: rows.reduce((sum, row) => sum + row.stats.count, 0),
-    unqualified: rows.reduce((sum, row) => sum + row.stats.unqualified, 0)
+    unqualified: rows.reduce((sum, row) => sum + row.stats.unqualified, 0),
+    pending: rows.reduce((sum, row) => sum + row.stats.pending, 0)
   })
 
   function openCreate(): void {
@@ -219,10 +221,16 @@
     <StatBadge label="数量合计" value={totals.quantity} suffix="根/处" tone="info" />
     <StatBadge label="关联测点" value={totals.points} suffix="点" tone="default" />
     <StatBadge
-      label="不合格测点"
+      label="不合格测点（估算）"
       value={totals.unqualified}
       suffix="点"
       tone={totals.unqualified > 0 ? 'danger' : 'success'}
+    />
+    <StatBadge
+      label="待判定（缺月份/系数）"
+      value={totals.pending}
+      suffix="点"
+      tone={totals.pending > 0 ? 'warning' : 'success'}
     />
   </div>
 
@@ -271,10 +279,16 @@
               <td>
                 {#if row.stats.count === 0}
                   <span class="gb-hint">未录入测点</span>
-                {:else if row.stats.unqualified > 0}
-                  <span class="gb-danger">{row.stats.unqualified} 点不合格</span>
                 {:else}
-                  <span class="ok-text">全部合格</span>
+                  {#if row.stats.unqualified > 0}
+                    <span class="gb-danger">{row.stats.unqualified} 点不合格</span>
+                  {/if}
+                  {#if row.stats.pending > 0}
+                    <span class="gb-warn">{row.stats.pending} 点待判定</span>
+                  {/if}
+                  {#if row.stats.unqualified === 0 && row.stats.pending === 0}
+                    <span class="ok-text">全部合格（估算口径）</span>
+                  {/if}
                 {/if}
               </td>
               <td class="row-actions">
@@ -305,7 +319,9 @@
                           <tr>
                             <th>测点编号</th>
                             <th>位置</th>
-                            <th class="is-num">实测（Ω）</th>
+                            <th class="is-num">原始实测（Ω）</th>
+                            <th class="is-num">系数</th>
+                            <th class="is-num">最不利估算（Ω）</th>
                             <th class="is-num">限值（Ω）</th>
                             <th>判定</th>
                             <th>检测仪器</th>
@@ -313,12 +329,29 @@
                         </thead>
                         <tbody>
                           {#each pointsOfDevice(row.device.id) as point (point.id)}
+                            {@const ps = evaluateSeasonPoint({
+                              measuredOhm: point.measuredOhm,
+                              limitOhm: point.limitOhm,
+                              measureDate: point.measureDate,
+                              siteSeasonFactor: point.siteSeasonFactor
+                            })}
                             <tr>
                               <td class="gb-mono">{point.code}</td>
                               <td>{point.location}</td>
                               <td class="is-num gb-mono">{point.measuredOhm}</td>
+                              <td class="is-num gb-mono">
+                                {#if ps.factor !== null}{ps.factor.toFixed(2)}{:else}<span class="gb-warn">缺</span>{/if}
+                              </td>
+                              <td class="is-num gb-mono">{ps.estimatedOhm ?? '—'}</td>
                               <td class="is-num gb-mono">{point.limitOhm}</td>
-                              <td><QualifyTag measuredOhm={point.measuredOhm} limitOhm={point.limitOhm} size="small" /></td>
+                              <td>
+                                <QualifyTag
+                                  measuredOhm={point.measuredOhm}
+                                  limitOhm={point.limitOhm}
+                                  season={ps}
+                                  size="small"
+                                />
+                              </td>
                               <td class="gb-hint">{point.meter}</td>
                             </tr>
                           {/each}

@@ -16,7 +16,8 @@
   import { pointList } from '$lib/stores/pointStore.ts'
   import { rectifyList } from '$lib/stores/rectifyStore.ts'
   import { DB_NAME, DB_VERSION } from '$lib/utils/db.ts'
-  import { qualifyRate, isQualified } from '$lib/utils/resistance.ts'
+  import { judgeBuckets } from '$lib/utils/resistance.ts'
+  import { evaluateSeasonPoint } from '$lib/utils/season.ts'
 
   const { push } = useRouter()
 
@@ -25,8 +26,19 @@
   const activeRoute = $derived(resolveRoute(current))
 
   const pointCount = $derived($pointList.length)
-  const unqualifiedCount = $derived($pointList.filter((point) => !isQualified(point.measuredOhm, point.limitOhm)).length)
-  const rate = $derived(qualifyRate($pointList.map((point) => isQualified(point.measuredOhm, point.limitOhm))))
+  /** 判定与合格率均按季节修正后的最不利季节估算值统计 */
+  const pointBuckets = $derived(
+    judgeBuckets(
+      $pointList.map((point) =>
+        evaluateSeasonPoint({
+          measuredOhm: point.measuredOhm,
+          limitOhm: point.limitOhm,
+          measureDate: point.measureDate,
+          siteSeasonFactor: point.siteSeasonFactor
+        }).result
+      )
+    )
+  )
   const pendingRectify = $derived($rectifyList.filter((rectify) => rectify.state !== '已复检').length)
 
   /** 导航高亮：根路径也算建筑物台账 */
@@ -66,7 +78,7 @@
           {:else if item.path === '/points'}
             <em class="app-nav__badge">{pointCount}</em>
           {:else if item.path === '/verdicts'}
-            <em class="app-nav__badge">{unqualifiedCount}</em>
+            <em class="app-nav__badge">{pointBuckets.failed}</em>
           {/if}
         </a>
       {/each}
@@ -88,7 +100,7 @@
       本地库 {DB_NAME} · 结构版本 v{DB_VERSION} · 数据仅存于本浏览器 IndexedDB，不上传任何服务器。
     </span>
     <span>
-      建筑物 {$buildingList.length} · 装置 {$deviceList.length} · 测点 {pointCount} · 不合格 {unqualifiedCount} · 合格率 {rate}% · 未闭环整改 {pendingRectify}
+      建筑物 {$buildingList.length} · 装置 {$deviceList.length} · 测点 {pointCount} · 不合格（估算口径） {pointBuckets.failed} · 待判定 {pointBuckets.pending} · 合格率 {pointBuckets.rate}% · 未闭环整改 {pendingRectify}
     </span>
   </footer>
 </div>
